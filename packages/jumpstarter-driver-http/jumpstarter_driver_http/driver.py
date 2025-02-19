@@ -61,20 +61,14 @@ class HttpServer(Driver):
         return "jumpstarter_driver_http.client.HttpServerClient"
 
     @export
-    async def put_file(self, filename: str, src_stream) -> str:
+    async def put_file(self, filename: str, src_stream, client_checksum: str | None = None) -> str:
         """
         Upload a file to the HTTP server.
 
         Args:
             filename (str): Name of the file to upload.
             src_stream: Stream of file content.
-
-        Returns:
-            str: Name of the uploaded file.
-
-        Raises:
-            HttpServerError: If the target path is invalid.
-            FileWriteError: If the file upload fails.
+            client_checksum (str | None, optional): Optional SHA256 checksum for verification.
         """
         try:
             file_path = os.path.join(self.root_dir, filename)
@@ -82,12 +76,28 @@ class HttpServer(Driver):
             if not Path(file_path).resolve().is_relative_to(Path(self.root_dir).resolve()):
                 raise HttpServerError("Invalid target path")
 
+            self.logger.info(f"Starting file upload: {filename}")
+            if client_checksum:
+                self.logger.info(f"Expected checksum from client: {client_checksum}")
+
             async with await FileWriteStream.from_path(file_path) as dst:
                 async with self.resource(src_stream) as src:
                     async for chunk in src:
                         await dst.send(chunk)
 
-            self.logger.info(f"File '{filename}' written to '{file_path}'")
+            actual_checksum = self._compute_checksum(file_path)
+            self.logger.info(f"Server computed checksum: {actual_checksum}")
+
+            if client_checksum is not None:
+                if actual_checksum != client_checksum:
+                    self.logger.error(f"Checksum mismatch for {filename}")
+                    self.logger.error(f"Expected: {client_checksum}")
+                    self.logger.error(f"Actual:   {actual_checksum}")
+                    os.unlink(file_path)
+                    raise FileWriteError(f"Checksum verification failed for file '{filename}'")
+                else:
+                    self.logger.info("Checksum verification successful")
+
             return f"{self.get_url()}/{filename}"
 
         except Exception as e:

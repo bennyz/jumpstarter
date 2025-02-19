@@ -155,49 +155,56 @@ class FileServerClient(DriverClient):
         return self.call("put_file", filename, src_stream)
 
     def put_file_from_source(self, source: str, checksum: str | None = None):
-      """
-      Upload a file from either a local path or URL to the server.
+        """
+        Upload a file from either a local path or URL to the server.
 
-      Args:
-          source (str): Local file path or URL to upload
-          checksum (str, optional): SHA256 checksum of the file. If not provided,
-              will be computed for local files only.
-      """
-      self.logger.info(f"Starting upload from source: {source}")
+        Args:
+            source (str): Local file path or URL to upload
+            checksum (str, optional): SHA256 checksum of the file. If provided,
+                will be used for verification
+        """
+        self.logger.info(f"Starting upload from source: {source}")
 
-      if source.startswith(('http://', 'https://')):
-          parsed_url = urlparse(source)
-          operator = Operator(
-              'http',
-              root='/',
-              endpoint=f"{parsed_url.scheme}://{parsed_url.netloc}"
-          )
-          filename = parsed_url.path.split('/')[-1]
-          path = parsed_url.path
-          if path.startswith('/'):
-              path = path[1:]
+        if source.startswith(('http://', 'https://')):
+            parsed_url = urlparse(source)
+            operator = Operator(
+                'http',
+                root='/',
+                endpoint=f"{parsed_url.scheme}://{parsed_url.netloc}"
+            )
+            filename = parsed_url.path.split('/')[-1]
+            path = parsed_url.path
+            if path.startswith('/'):
+                path = path[1:]
 
-          if checksum is None:
-              self.logger.warning("No checksum provided for remote file - skipping verification")
-      else:
-          operator = Operator('fs', root='/')
-          path = str(Path(source).resolve())
-          filename = Path(path).name
+            if checksum is None:
+                self.logger.warning("No checksum provided for remote file - skipping verification")
+        else:
+            operator = Operator('fs', root='/')
+            path = str(Path(source).resolve())
+            filename = Path(path).name
 
-          if checksum is None:
-              self.logger.info(f"Computing checksum for local file: {filename}")
-              checksum = self.compute_checksum(source)
+            if checksum is None:
+                computed_checksum = self.compute_checksum(source)
+                self.logger.info(f"Computed checksum for local file {filename}: {computed_checksum}")
+                checksum = computed_checksum
+            else:
+                computed_checksum = self.compute_checksum(source)
+                self.logger.info(f"Provided checksum: {checksum}")
+                self.logger.info(f"Computed checksum: {computed_checksum}")
+                if computed_checksum != checksum:
+                    self.logger.warning("Checksum mismatch between provided and computed values")
 
-      if checksum and self.check_file_checksum(filename, checksum):
-          self.logger.info(f"Skipping upload of identical file: {filename}")
-          return filename
+        if checksum and self.check_file_checksum(filename, checksum):
+            self.logger.info(f"Skipping upload of identical file: {filename}")
+            return filename
 
-      self.logger.info(f"Opening adapter for {filename}")
-      with OpendalAdapter(client=self, operator=operator, path=path, mode="rb") as handle:
-          self.logger.info(f"Putting file {filename}")
-          result = self.put_file(filename, handle, checksum)
-          self.logger.info(f"Completed upload of {filename}")
-          return result
+        self.logger.info(f"Opening adapter for {filename}")
+        with OpendalAdapter(client=self, operator=operator, path=path, mode="rb") as handle:
+            self.logger.info(f"Putting file {filename}")
+            result = self.put_file(filename, handle, checksum)
+            self.logger.info(f"Completed upload of {filename}")
+            return result
 
     def delete_file(self, filename: str) -> str:
         """Delete a file from the server"""

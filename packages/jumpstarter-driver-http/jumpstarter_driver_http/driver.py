@@ -90,11 +90,9 @@ class HttpServer(Driver):
 
             if client_checksum is not None:
                 if actual_checksum != client_checksum:
-                    self.logger.error(f"Checksum mismatch for {filename}")
-                    self.logger.error(f"Expected: {client_checksum}")
-                    self.logger.error(f"Actual:   {actual_checksum}")
-                    os.unlink(file_path)
-                    raise FileWriteError(f"Checksum verification failed for file '{filename}'")
+                    self.logger.warning(f"Checksum mismatch for {filename}")
+                    self.logger.warning(f"Expected: {client_checksum}")
+                    self.logger.warning(f"Actual:   {actual_checksum}")
                 else:
                     self.logger.info("Checksum verification successful")
 

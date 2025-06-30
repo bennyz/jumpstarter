@@ -17,11 +17,11 @@ def determine_architecture(arch, image):
 
     if "aarch64" in image.lower() or "arm64" in image.lower():
         return "aarch64"
-    elif "x86_64" in image.lower() or "amd64" in image.lower():
+    if "x86_64" in image.lower() or "amd64" in image.lower():
         return "x86_64"
-    else:
-        system_arch = platform.machine()
-        return "aarch64" if system_arch in ["aarch64", "arm64"] else "x86_64"
+
+    system_arch = platform.machine()
+    return "aarch64" if system_arch in ["aarch64", "arm64"] else "x86_64"
 
 
 def handle_file_storage(image, location, lun_name, storage):
@@ -31,6 +31,12 @@ def handle_file_storage(image, location, lun_name, storage):
     if location and location.startswith("/dev/"):
         is_block_device = True
         click.secho(f"Using block device: {location}", fg="blue")
+        if not click.confirm(
+            f"Are you sure you want to write to block device {location}? This will overwrite all data!",
+            default=False,
+        ):
+            raise click.Abort()
+
         device_path, fs_operator, _ = operator_for_path(location)
         click.secho("Writing image to block device...", fg="blue")
         storage.write_from_path(str(device_path), image, operator=fs_operator)
@@ -38,9 +44,7 @@ def handle_file_storage(image, location, lun_name, storage):
     else:
         target_path = location if location else f"{lun_name}.img"
         click.secho(f"Using storage path: {target_path}", fg="blue")
-        with open(image, "rb") as f:
-            data = f.read()
-            storage.write_bytes(target_path, data)
+        storage.write_from_path(target_path, image)
 
     return target_path, is_block_device
 
@@ -49,8 +53,8 @@ def generate_qemu_command(target_arch, host, port, target_iqn):
     """Generate QEMU command based on architecture"""
     if target_arch == "aarch64":
         return f"qemu-system-aarch64 -m 2048 -machine virt -cpu cortex-a72 -drive file=iscsi://{host}:{port}/{target_iqn}/0,format=raw"
-    else:
-        return f"qemu-system-x86_64 -m 2048 -drive file=iscsi://{host}:{port}/{target_iqn}/0,format=raw"
+
+    return f"qemu-system-x86_64 -m 2048 -drive file=iscsi://{host}:{port}/{target_iqn}/0,format=raw"
 
 
 @click.command()

@@ -1,6 +1,5 @@
 import os
 import socket
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -83,17 +82,17 @@ class ISCSI(Driver):
     def client(cls) -> str:
         return "jumpstarter_driver_iscsi.client.ISCSIServerClient"
 
-    @contextmanager
     def _configure_target(self):
-        """Configure the iSCSI target"""
-        self._rtsroot = RTSRoot()
-
-        self._setup_target()
-        self._setup_network_portal()
-        self._configure_tpg_attributes()
-
+        """Helper that configures the target; formerly a context-manager but the
+        implicit enter/exit semantics were confusing and the driver never
+        needed teardown at this point.
+        """
         try:
-            yield
+            self._rtsroot = RTSRoot()
+
+            self._setup_target()
+            self._setup_network_portal()
+            self._configure_tpg_attributes()
         except Exception as e:
             self.logger.error(f"Error in iSCSI target configuration: {e}")
             raise
@@ -102,7 +101,7 @@ class ISCSI(Driver):
         """Setup the iSCSI target"""
         target_exists = False
         try:
-            targets_list = list(self._rtsroot.targets)
+            targets_list = list(self._rtsroot.targets)  # type: ignore[attr-defined]
             for target in targets_list:
                 if target.wwn == self._iqn:
                     self._target = target
@@ -118,20 +117,20 @@ class ISCSI(Driver):
 
         if not target_exists:
             self.logger.info(f"Creating new target: {self._iqn}")
-            fabric_modules = {m.name: m for m in list(self._rtsroot.fabric_modules)}
+            fabric_modules = {m.name: m for m in list(self._rtsroot.fabric_modules)}  # type: ignore[attr-defined]
             iscsi_fabric = fabric_modules.get("iscsi")
             if not iscsi_fabric:
                 raise ISCSIError("Could not find iSCSI fabric module")
             self._target = Target(iscsi_fabric, self._iqn)
             self._tpg = TPG(self._target, 1)
 
-        self._tpg.enable = True
+        self._tpg.enable = True  # type: ignore[attr-defined]
 
     def _setup_network_portal(self):
         """Setup the network portal for the target"""
         portal_exists = False
         try:
-            portals = list(self._tpg.network_portals)
+            portals = list(self._tpg.network_portals)  # type: ignore[attr-defined]
             for portal in portals:
                 if portal.ip_address == self.host and portal.port == self.port:
                     portal_exists = True
@@ -145,9 +144,9 @@ class ISCSI(Driver):
 
     def _configure_tpg_attributes(self):
         """Configure TPG attributes"""
-        self._tpg.set_attribute("authentication", "0")
-        self._tpg.set_attribute("generate_node_acls", "1")
-        self._tpg.set_attribute("demo_mode_write_protect", "0")
+        self._tpg.set_attribute("authentication", "0")  # type: ignore[attr-defined]
+        self._tpg.set_attribute("generate_node_acls", "1")  # type: ignore[attr-defined]
+        self._tpg.set_attribute("demo_mode_write_protect", "0")  # type: ignore[attr-defined]
 
     @export
     def start(self):
@@ -159,8 +158,8 @@ class ISCSI(Driver):
             ISCSIError: If the server fails to start
         """
         try:
-            with self._configure_target():
-                self.logger.info(f"iSCSI target server started at {self.host}:{self.port}")
+            self._configure_target()
+            self.logger.info(f"iSCSI target server started at {self.host}:{self.port}")
         except Exception as e:
             raise ISCSIError(f"Failed to start iSCSI target server: {e}") from e
 

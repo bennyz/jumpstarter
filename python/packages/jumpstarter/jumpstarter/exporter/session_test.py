@@ -1,5 +1,7 @@
 """Tests for session GetReport with descriptions and methods_description"""
 
+import grpc
+import pytest
 from google.protobuf import empty_pb2
 
 from jumpstarter.common.utils import serve
@@ -328,4 +330,33 @@ def test_logging_queue_maxlen_256():
         )
 
         assert session._logging_queue.maxlen == 256
+
+
+@pytest.mark.anyio
+async def test_serve_tcp_async_insecure():
+    """Test that Session.serve_tcp_async binds TCP and serves GetReport (insecure)."""
+    from jumpstarter_protocol import jumpstarter_pb2_grpc, router_pb2_grpc
+
+    driver = SimpleDriver(description="TCP test driver")
+    session = Session(
+        uuid=driver.uuid,
+        labels=driver.labels,
+        root_device=driver,
+    )
+    with session:
+        # Use port 0 to let the OS choose a free port; gRPC returns the bound port
+        server = grpc.aio.server()
+        bound_port = server.add_insecure_port("127.0.0.1:0")
+        assert bound_port > 0
+        jumpstarter_pb2_grpc.add_ExporterServiceServicer_to_server(session, server)
+        router_pb2_grpc.add_RouterServiceServicer_to_server(session, server)
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{bound_port}") as channel:
+                stub = jumpstarter_pb2_grpc.ExporterServiceStub(channel)
+                response = await stub.GetReport(empty_pb2.Empty())
+            assert len(response.reports) >= 1
+            assert response.uuid == str(driver.uuid)
+        finally:
+            await server.stop(grace=0.5)
 

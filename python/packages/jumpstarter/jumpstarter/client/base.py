@@ -96,6 +96,45 @@ class DriverClient(AsyncDriverClient):
         """
         return self.stack.enter_context(self.stream())
 
+    def cli(self):
+        """Auto-generate a CLI from methods_description.
+
+        Creates a click group with one subcommand per method. Each subcommand
+        accepts positional arguments (parsed as JSON where possible) and prints
+        the result.
+        """
+        import json as _json
+
+        import click
+
+        from jumpstarter.client.decorators import driver_click_group
+
+        @driver_click_group(self)
+        def base():
+            """Generic driver interface"""
+            pass
+
+        for method_name in self.methods_description:
+            help_text = self.methods_description[method_name] or None
+
+            @base.command(name=method_name, help=help_text)
+            @click.argument("args", nargs=-1)
+            def cmd(args, _method=method_name):
+                parsed = []
+                for a in args:
+                    try:
+                        parsed.append(_json.loads(a))
+                    except (ValueError, _json.JSONDecodeError):
+                        parsed.append(a)
+                result = self.call(_method, *parsed)
+                if result is not None:
+                    if isinstance(result, (dict, list)):
+                        click.echo(_json.dumps(result, indent=2))
+                    else:
+                        click.echo(result)
+
+        return base
+
     def close(self):
         """
         Close the open stream session without a context manager.

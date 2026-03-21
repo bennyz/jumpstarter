@@ -6,18 +6,38 @@ from anyio.from_thread import start_blocking_portal
 from jumpstarter.client import client_from_path
 from jumpstarter.common.exceptions import EnvironmentVariableNotSetError
 from jumpstarter.config.client import ClientConfigV1Alpha1Drivers
-from jumpstarter.config.env import JMP_GRPC_INSECURE, JMP_GRPC_PASSPHRASE, JUMPSTARTER_GRPC_INSECURE, JUMPSTARTER_HOST
+from jumpstarter.config.env import (
+    JMP_GRPC_INSECURE,
+    JMP_GRPC_PASSPHRASE,
+    JUMPSTARTER_GRPC_INSECURE,
+    JUMPSTARTER_HOST,
+    JUMPSTARTER_MICRO,
+)
 
 
 @asynccontextmanager
 async def env_async(portal, stack):
-    """Provide a client for an existing JUMPSTARTER_HOST environment variable.
+    """Provide a client for an existing JUMPSTARTER_HOST or JUMPSTARTER_MICRO variable.
 
     Async version of env()
 
     This is useful when interacting with an already established Jumpstarter shell,
     to either a local exporter or a remote one.
     """
+    micro_address = os.environ.get(JUMPSTARTER_MICRO)
+    if micro_address:
+        from jumpstarter.client.micro import client_from_micro
+
+        async with client_from_micro(
+            micro_address, portal, stack, allow=[], unsafe=True,
+        ) as client:
+            try:
+                yield client
+            finally:
+                if hasattr(client, "close"):
+                    client.close()
+        return
+
     host = os.environ.get(JUMPSTARTER_HOST, None)
     if host is None:
         raise EnvironmentVariableNotSetError(f"{JUMPSTARTER_HOST} not set")

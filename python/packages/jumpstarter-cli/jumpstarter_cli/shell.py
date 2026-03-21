@@ -26,7 +26,7 @@ from jumpstarter.common import HOOK_WARNING_PREFIX, ExporterStatus
 from jumpstarter.common.exceptions import ConnectionError, ExporterOfflineError
 from jumpstarter.common.utils import launch_shell
 from jumpstarter.config.client import ClientConfigV1Alpha1
-from jumpstarter.config.env import JMP_LEASE
+from jumpstarter.config.env import JMP_LEASE, JUMPSTARTER_MICRO
 from jumpstarter.config.exporter import ExporterConfigV1Alpha1
 from jumpstarter.config.tls import TLSConfigV1Alpha1
 
@@ -369,6 +369,63 @@ async def _resolve_lease_from_active_async(config) -> str:
     )
 
 
+def _shell_micro(micro_address: str, command: tuple) -> int:
+    """Launch a shell connected to a jmp-micro exporter on an MCU.
+
+    Sets JUMPSTARTER_MICRO so the `j` CLI inside the shell connects
+    directly to the MCU using the micro wire protocol.
+    """
+    from jumpstarter.common.utils import _run_process
+
+    env = os.environ | {
+        JUMPSTARTER_MICRO: micro_address,
+    }
+
+    if command:
+        return _run_process(list(command), env)
+
+    # Launch interactive shell with micro-specific prompt
+    shell = os.environ.get("SHELL", "bash")
+    shell_name = os.path.basename(shell)
+    context = f"micro:{micro_address}"
+
+    if shell_name.endswith("bash"):
+        from jumpstarter.common.utils import (
+            ANSI_GRAY,
+            ANSI_RESET,
+            ANSI_WHITE,
+            ANSI_YELLOW,
+            PROMPT_CWD,
+        )
+
+        env["PS1"] = (
+            f"{ANSI_GRAY}{PROMPT_CWD} "
+            f"{ANSI_YELLOW}⚡{ANSI_WHITE}{context} "
+            f"{ANSI_YELLOW}➤{ANSI_RESET} "
+        )
+        return _run_process([shell, "--norc", "--noprofile"], env)
+    elif shell_name == "fish":
+        fish_fn = (
+            "function fish_prompt; "
+            "set_color grey; "
+            'printf "%s" (basename $PWD); '
+            "set_color yellow; "
+            'printf "⚡"; '
+            "set_color white; "
+            f'printf "{context}"; '
+            "set_color yellow; "
+            'printf "➤ "; '
+            "set_color normal; "
+            "end"
+        )
+        return _run_process([shell, "--init-command", fish_fn], env)
+    elif shell_name == "zsh":
+        env["PS1"] = f"%F{{8}}%1~ %F{{yellow}}⚡%F{{white}}{context} %F{{yellow}}➤%f "
+        return _run_process([shell, "--no-rcs"], env)
+    else:
+        return _run_process([shell], env)
+
+
 async def _shell_direct_async(
     tls_grpc_address: str,
     tls_grpc_insecure: bool,
@@ -446,6 +503,13 @@ async def _shell_direct_async(
     default=None,
     help="Passphrase for authenticating with a standalone exporter (--tls-grpc).",
 )
+# micro exporter connection
+@click.option(
+    "--micro",
+    "micro_address",
+    metavar="HOST:PORT",
+    help="Connect to a jmp-micro exporter on a microcontroller. E.g. 10.100.102.34:3333.",
+)
 # end client specific
 @handle_exceptions_with_reauthentication(relogin_client)
 def shell(
@@ -460,6 +524,7 @@ def shell(
     tls_grpc_address,
     tls_grpc_insecure,
     passphrase,
+    micro_address,
 ):
     """
     Spawns a shell (or custom command) connecting to a local or remote exporter
@@ -473,6 +538,10 @@ def shell(
         $ jmp shell --exporter foo -- python bar.py
         $ jmp shell --tls-grpc exporter.host.name:1234
     """
+
+    if micro_address is not None:
+        exit_code = _shell_micro(micro_address, command)
+        sys.exit(exit_code)
 
     if tls_grpc_address is not None:
         exit_code = anyio.run(

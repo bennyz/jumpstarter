@@ -12,7 +12,7 @@ import anyio.to_thread
 import click
 import grpc
 import grpc.aio
-from anyio import create_task_group, get_cancelled_exc_class
+from anyio import CancelScope, create_task_group, get_cancelled_exc_class
 from jumpstarter_cli_common.config import opt_config
 from jumpstarter_cli_common.exceptions import find_exception_in_group, handle_exceptions_with_reauthentication
 from jumpstarter_cli_common.oidc import (
@@ -504,6 +504,7 @@ async def _shell_with_signal_handling(  # noqa: C901
             try:
                 async with anyio.from_thread.BlockingPortal() as portal:
                     connect_deadline = None
+                    connect_start = None
                     while True:
                         async with config.lease_async(
                             selector, exporter_name, lease_name, duration, portal, acquisition_timeout,
@@ -511,8 +512,10 @@ async def _shell_with_signal_handling(  # noqa: C901
                         ) as lease:
                             lease_used = lease
 
-                            # Start token monitoring only once we're in the shell
-                            tg.start_soon(_monitor_token_expiry, config, lease, tg.cancel_scope, token_state)
+                            monitor_scope = CancelScope()
+                            tg.start_soon(
+                                _monitor_token_expiry, config, lease, monitor_scope, token_state
+                            )
 
                             unreachable = None
                             try:
@@ -525,6 +528,8 @@ async def _shell_with_signal_handling(  # noqa: C901
                                     raise
                             except ExporterUnreachableError as exc:
                                 unreachable = exc
+                            finally:
+                                monitor_scope.cancel()
                             if unreachable is not None:
                                 if lease.lease_ended:
                                     break  # lease expired naturally — exit cleanly
@@ -534,11 +539,13 @@ async def _shell_with_signal_handling(  # noqa: C901
                                         "Session is no longer valid."
                                     ) from unreachable
                                 if connect_deadline is None:
-                                    connect_deadline = time.monotonic() + lease.retry_timeout
+                                    connect_start = time.monotonic()
+                                    connect_deadline = connect_start + lease.retry_timeout
                                 if time.monotonic() >= connect_deadline:
+                                    elapsed = time.monotonic() - connect_start
                                     raise ExporterUnreachableError(
                                         f"Exporter {lease.exporter_name} unreachable after "
-                                        f"{lease.retry_timeout:.0f}s of retrying"
+                                        f"{elapsed:.0f}s of retrying: {unreachable}"
                                     ) from unreachable
                                 logger.warning(
                                     "Exporter %s is unreachable, releasing lease and retrying...",
@@ -546,6 +553,8 @@ async def _shell_with_signal_handling(  # noqa: C901
                                 )
                                 logger.debug("Unreachable cause: %s", unreachable)
                                 continue  # lease released by __aexit__, loop re-acquires
+                            connect_deadline = None
+                            connect_start = None
                             if lease.release and lease.name and token_state["expired_unrecovered"]:
                                 _warn_about_expired_token(lease.name, selector)
                             break

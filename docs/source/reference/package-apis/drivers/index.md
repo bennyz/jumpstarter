@@ -87,6 +87,7 @@ Drivers for virtual and emulated targets:
 - {doc}`QEMU <qemu>` (`jumpstarter-driver-qemu`) - QEMU virtual machine management
 - {doc}`Renode <renode>` (`jumpstarter-driver-renode`) - Renode embedded systems emulation
 - {doc}`Corellium <corellium>` (`jumpstarter-driver-corellium`) - Corellium virtualization platform
+- {doc}`Netsim <netsim>` (`jumpstarter-driver-netsim`) - Android netsim virtual radio control (Bluetooth, WiFi, UWB)
 
 ### Utility
 
@@ -114,6 +115,7 @@ http.md
 http-power.md
 iscsi.md
 mitmproxy.md
+netsim.md
 network.md
 noyito-relay.md
 obd.md

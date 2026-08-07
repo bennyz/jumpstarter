@@ -22,6 +22,7 @@ dependencies = [
   "jumpstarter-driver-esp32",
   "jumpstarter-driver-flashers",
   "jumpstarter-driver-http",
+  "jumpstarter-driver-netsim",
   "jumpstarter-driver-network",
   "jumpstarter-driver-obd",
   "jumpstarter-driver-opendal",

@@ -11,6 +11,7 @@ import requests
 from jumpstarter_driver_adb.driver import AdbServer
 from jumpstarter_driver_power.driver import PowerReading, VirtualPowerInterface
 
+from .cvdcli import cvd_argv, exec_binary, fleet_to_cvds, group_to_cvds, stderr_tail
 from jumpstarter.driver import Driver, export
 from jumpstarter.driver.flasher import FlasherInterface
 
@@ -21,6 +22,145 @@ class CuttlefishError(Exception):
 
 class CuttlefishTimeout(CuttlefishError):
     """Raised when an operation doesn't complete in time."""
+
+
+# Lifecycle operations understood by both backends. Host Orchestrator exposes
+# each one as a REST action; the cvd CLI exposes each one as a subcommand.
+OPERATIONS = ("create", "start", "stop", "restart", "powerwash", "powerbtn", "delete", "reset")
+
+
+class HostOrchestratorBackend:
+    """Drive CVDs through the Host Orchestrator REST API."""
+
+    _paths = {
+        "create": ("POST", "/cvds"),
+        "start": ("POST", "{cvd}/:start"),
+        "stop": ("POST", "{cvd}/:stop"),
+        "restart": ("POST", "{cvd}/:restart"),
+        "powerwash": ("POST", "{cvd}/:powerwash"),
+        "powerbtn": ("POST", "{cvd}/:powerbtn"),
+        "delete": ("DELETE", "{cvd}"),
+        "reset": ("POST", "/reset"),
+    }
+
+    def __init__(self, driver: "Cuttlefish"):
+        self.driver = driver
+
+    def health_fields(self) -> dict:
+        return {"backend": "http", "url": self.driver._base_url}
+
+    def status(self) -> None:
+        self.driver._request("GET", "/_debug/statusz")
+
+    def list_cvds(self) -> dict | list | str:
+        return self.driver._request("GET", "/cvds")
+
+    def get_cvd(self, group: str, name: str) -> dict | list | str:
+        return self.driver._request("GET", f"/cvds/{group}/{name}")
+
+    def list_operations(self) -> dict | list | str:
+        return self.driver._request("GET", "/operations")
+
+    def operate(self, op: str, group: str, name: str, data: dict | None, timeout: float) -> dict | list | str:
+        method, path = self._paths[op]
+        result = self.driver._request(method, path.format(cvd=f"/cvds/{group}/{name}"), data)
+        if isinstance(result, dict) and "done" in result:
+            op_name = result.get("name")
+            if not op_name:
+                raise CuttlefishError(f"operation response missing 'name': {result}")
+            self.driver.logger.info(f"Waiting for operation {op_name}")
+            return self.driver._wait_for_operation(str(op_name), timeout)
+        return result
+
+
+class CvdCliBackend:
+    """Drive CVDs by running ``cvd`` in the runtime container over jumpstarter-exec.
+
+    This is the in-Pod equivalent of Podcvd's ``podman exec ... cvd``: the
+    exporter never talks to an HTTP listener, and every action is a synchronous
+    ``cvd`` invocation whose exit code is the result. Host Orchestrator is itself
+    a thin wrapper over the same subcommands, so payloads and inventory documents
+    keep the same shape.
+    """
+
+    _subcommands = {
+        "start": ["start", "--report_anonymous_usage_stats=n"],
+        "stop": ["stop"],
+        "restart": ["restart"],
+        "powerwash": ["powerwash"],
+        "powerbtn": ["powerbtn"],
+    }
+    fleet_timeout = 30
+
+    def __init__(self, driver: "Cuttlefish"):
+        self.driver = driver
+        self.socket = driver.launcher_socket
+        self.user = driver.cvd_user
+        # The shared volume is the only path both containers see; env_config for
+        # ``cvd load`` must live there, next to the socket and the exec binary.
+        self.work_dir = Path(self.socket).parent
+
+    def health_fields(self) -> dict:
+        return {"backend": "exec", "socket": self.socket, "cvd_user": self.user}
+
+    def _cvd(self, args: list[str], timeout: float) -> str:
+        argv = cvd_argv(self.socket, self.user, args)
+        self.driver.logger.debug("running %s", " ".join(argv))
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        except OSError as e:
+            raise CuttlefishError(f"cannot run jumpstarter-exec at {exec_binary(self.socket)}: {e}") from e
+        except subprocess.TimeoutExpired as e:
+            raise CuttlefishTimeout(f"cvd {' '.join(args)} timed out after {timeout}s") from e
+        if proc.returncode != 0:
+            raise CuttlefishError(
+                f"cvd {' '.join(args)} failed with exit code {proc.returncode}: {stderr_tail(proc.stderr)}"
+            )
+        return proc.stdout
+
+    def fleet(self) -> list[dict]:
+        try:
+            return fleet_to_cvds(self._cvd(["fleet"], self.fleet_timeout))
+        except ValueError as e:
+            raise CuttlefishError(str(e)) from e
+
+    def status(self) -> None:
+        self.fleet()
+
+    def list_cvds(self) -> dict:
+        return {"cvds": self.fleet()}
+
+    def get_cvd(self, group: str, name: str) -> dict:
+        return {"cvds": [cvd for cvd in self.fleet() if cvd["group"] == group and cvd["name"] == name]}
+
+    def list_operations(self) -> dict | list | str:
+        raise CuttlefishError("the exec backend runs cvd synchronously and tracks no operations")
+
+    def operate(self, op: str, group: str, name: str, data: dict | None, timeout: float) -> dict:
+        if op == "create":
+            return self._create(data, timeout)
+        if op == "reset":
+            self._cvd(["reset", "-y"], timeout)
+            return {"done": True}
+        if op == "delete":
+            self._cvd([f"--group_name={group}", "remove"], timeout)
+            return {"done": True}
+        self._cvd([f"--group_name={group}", f"--instance_name={name}", *self._subcommands[op]], timeout)
+        return {"done": True}
+
+    def _create(self, data: dict | None, timeout: float) -> dict:
+        env_config = data.get("env_config") if isinstance(data, dict) else None
+        if not isinstance(env_config, dict):
+            raise CuttlefishError("create_cvd requires an env_config object")
+        config_path = self.work_dir / "env_config.json"
+        config_path.write_text(json.dumps(env_config, indent=1))
+        config_path.chmod(0o644)  # written by the exporter uid, read by the cvd user
+        output = self._cvd(["load", str(config_path)], timeout)
+        try:
+            cvds = group_to_cvds(json.loads(output))
+        except ValueError as e:
+            raise CuttlefishError(f"cvd load returned an unexpected document: {output[:200]!r}") from e
+        return {"done": True, "cvds": cvds}
 
 
 @dataclass(kw_only=True)
@@ -43,23 +183,31 @@ class Cuttlefish(Driver):
     env_config: dict = field(default_factory=dict)
     webrtc_url: str = ""
     managed: bool = False
+    # Exec backend: jumpstarter-exec launcher socket shared with the runtime
+    # container. When set, every lifecycle action runs ``cvd`` there instead of
+    # calling Host Orchestrator. ``cvd_user`` selects the uid whose cvd instance
+    # database is used; it must match other cvd callers in the container.
+    launcher_socket: str = ""
+    cvd_user: str = ""
     health_state_path: str = ""
     runtime_id_path: str = ""
     health_ports: list[int] = field(default_factory=list)
     _operation_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _health: dict = field(default_factory=dict, init=False, repr=False)
+    _backend: "HostOrchestratorBackend | CvdCliBackend" = field(init=False, repr=False)
     _cvd_group: str | None = field(default=None, init=False, repr=False)
     _cvd_name: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
         if hasattr(super(), "__post_init__"):
             super().__post_init__()
+        self._backend = CvdCliBackend(self) if self.launcher_socket else HostOrchestratorBackend(self)
         if self.managed:
             self._validate_managed_config()
             self._health = json.loads(Path(self.health_state_path).read_text())
             if self._health["runtime_id"] != Path(self.runtime_id_path).read_text().strip():
                 raise CuttlefishError("Cuttlefish runtime restarted before driver initialization")
-            self._health.update(url=self._base_url, ports=self.health_ports)
+            self._health.update(self._backend.health_fields(), ports=self.health_ports)
             self._write_health()
 
         self.children["power"] = CvdPower(parent=self)
@@ -91,10 +239,6 @@ class Cuttlefish(Driver):
     @property
     def _expected_adb_port(self) -> int:
         return 6520 + (self.instance_num - 1)
-
-    @property
-    def _cvd_path(self) -> str:
-        return f"/cvds/{self._cvd_group or self.group}/{self._cvd_name or self.name}"
 
     def _fmt(self, result) -> str:
         return json.dumps(result, indent=2) if isinstance(result, (dict, list)) else str(result)
@@ -161,39 +305,50 @@ class Cuttlefish(Driver):
         # HO creation forms and additional groups would bypass the Pod contract.
         if data != {"env_config": self.env_config}:
             raise CuttlefishError("managed create_cvd requires the configured env_config")
-        existing = self._request("GET", "/cvds")
+        existing = self._backend.list_cvds()
         if not isinstance(existing, dict) or not isinstance(existing.get("cvds"), list):
             raise CuttlefishError("invalid CVD inventory; refusing creation")
         if existing["cvds"]:
             raise CuttlefishError("managed Cuttlefish already has a CVD; destroy it before creating another")
 
-    def _do_operation(self, method: str, path: str, data: dict | None = None, timeout: float = 300):
+    def _do_operation(
+        self,
+        op: str,
+        data: dict | None = None,
+        timeout: float = 300,
+        group: str | None = None,
+        name: str | None = None,
+    ):
+        """Run a lifecycle operation on this driver's CVD, or on ``group``/``name`` if given."""
+        if op not in OPERATIONS:
+            raise CuttlefishError(f"unknown operation {op!r}")
         if not self.managed:
-            return self._perform_operation(method, path, data, timeout)
+            return self._perform_operation(op, data, timeout, group, name)
         with self._operation_lock:
-            if method == "POST" and path == "/cvds":
+            if op == "create":
                 self._validate_creation(data)
             state = self._health.get("state", "off")
             target_state = state
-            if path == "/reset" or method == "DELETE" or path.endswith("/:stop"):
+            if op in ("reset", "delete", "stop"):
                 target_state = "off"
-            elif path == "/cvds" or path.endswith(("/:start", "/:restart", "/:powerwash")):
+            elif op in ("create", "start", "restart", "powerwash"):
                 target_state = "running"
             # Probes allow bounded transitions, then fail closed if the operation
             # hangs or leaves the target's state unknown.
             self._health.update(state="transition", deadline=time.monotonic() + timeout + 30)
             self._write_health()
             try:
-                result = self._perform_operation(method, path, data, timeout)
+                result = self._perform_operation(op, data, timeout, group, name)
             except Exception:
                 self._health["state"] = "failed"
                 self._write_health()
                 raise
-            if isinstance(result, dict) and path == "/cvds":
+            if isinstance(result, dict) and op == "create":
                 cvds = result.get("cvds", [])
                 if len(cvds) == 1:
                     self._cvd_group = cvds[0].get("group")
                     self._cvd_name = cvds[0].get("name")
+            self._health.pop("deadline", None)  # only meaningful while in transition
             self._health.update(
                 state=target_state, group=self._cvd_group or self.group, name=self._cvd_name or self.name,
             )
@@ -202,19 +357,15 @@ class Cuttlefish(Driver):
 
     def _perform_operation(
         self,
-        method: str,
-        path: str,
+        op: str,
         data: dict | None = None,
         timeout: float = 300,
+        group: str | None = None,
+        name: str | None = None,
     ) -> dict | list | str:
-        result = self._request(method, path, data)
-        if isinstance(result, dict) and "done" in result:
-            op_name = result.get("name")
-            if not op_name:
-                raise CuttlefishError(f"operation response missing 'name': {result}")
-            self.logger.info(f"Waiting for operation {op_name}")
-            return self._wait_for_operation(str(op_name), timeout)
-        return result
+        group = group or self._cvd_group or self.group
+        name = name or self._cvd_name or self.name
+        return self._backend.operate(op, group, name, data, timeout)
 
     def _get_existing_cvds(self) -> list[dict]:
         """Return CVDs belonging to this driver's group.
@@ -222,7 +373,7 @@ class Cuttlefish(Driver):
         Raises CuttlefishError on connection/timeout/server failures so callers
         don't mistake a failed query for "no CVDs exist".
         """
-        result = self._request("GET", "/cvds")
+        result = self._backend.list_cvds()
         if not isinstance(result, dict):
             raise CuttlefishError(f"unexpected response from GET /cvds: {result!r}")
         all_cvds = result.get("cvds", [])
@@ -333,31 +484,31 @@ class Cuttlefish(Driver):
 
     @export
     def list_cvds(self) -> str:
-        return self._fmt(self._request("GET", "/cvds"))
+        return self._fmt(self._backend.list_cvds())
 
     @export
     def get_cvd(self) -> str:
-        return self._fmt(self._request("GET", self._cvd_path))
+        return self._fmt(self._backend.get_cvd(self._cvd_group or self.group, self._cvd_name or self.name))
 
     @export
     def restart_cvd(self) -> str:
         self.logger.info(f"Restarting CVD {self.group}/{self.name}")
-        return self._fmt(self._do_operation("POST", f"{self._cvd_path}/:restart"))
+        return self._fmt(self._do_operation("restart"))
 
     @export
     def powerwash_cvd(self) -> str:
         self.logger.info(f"Powerwashing CVD {self.group}/{self.name}")
-        return self._fmt(self._do_operation("POST", f"{self._cvd_path}/:powerwash"))
+        return self._fmt(self._do_operation("powerwash"))
 
     @export
     def powerbtn_cvd(self) -> str:
         self.logger.info(f"Power button on CVD {self.group}/{self.name}")
-        return self._fmt(self._do_operation("POST", f"{self._cvd_path}/:powerbtn"))
+        return self._fmt(self._do_operation("powerbtn"))
 
     @export
     def status(self) -> str:
-        """Check that nginx and Host Orchestrator are both reachable."""
-        self._request("GET", "/_debug/statusz")
+        """Check that the runtime backend (Host Orchestrator or cvd over jumpstarter-exec) answers."""
+        self._backend.status()
         return "OK"
 
     @export
@@ -366,23 +517,23 @@ class Cuttlefish(Driver):
             config = json.loads(config_json)
         except json.JSONDecodeError as e:
             raise CuttlefishError(f"invalid JSON: {e}") from e
-        return self._fmt(self._do_operation("POST", "/cvds", config, timeout=600))
+        return self._fmt(self._do_operation("create", config, timeout=600))
 
     @export
     def start_cvd(self) -> str:
-        return self._fmt(self._do_operation("POST", f"{self._cvd_path}/:start", {}))
+        return self._fmt(self._do_operation("start", {}))
 
     @export
     def stop_cvd(self) -> str:
-        return self._fmt(self._do_operation("POST", f"{self._cvd_path}/:stop"))
+        return self._fmt(self._do_operation("stop"))
 
     @export
     def delete_cvd(self) -> str:
-        return self._fmt(self._do_operation("DELETE", self._cvd_path))
+        return self._fmt(self._do_operation("delete"))
 
     @export
     def get_adb_port(self) -> str:
-        result = self._request("GET", self._cvd_path)
+        result = self._backend.get_cvd(self._cvd_group or self.group, self._cvd_name or self.name)
         if isinstance(result, dict):
             for cvd in result.get("cvds", []):
                 port = cvd.get("adb_port")
@@ -392,7 +543,7 @@ class Cuttlefish(Driver):
 
     @export
     def list_operations(self) -> str:
-        return self._fmt(self._request("GET", "/operations"))
+        return self._fmt(self._backend.list_operations())
 
     @export
     def wait_boot(self, timeout: int = 0) -> str:
@@ -410,7 +561,7 @@ class Cuttlefish(Driver):
         """
         self.logger.warning("Resetting host orchestrator")
         self._auto_disconnect_adb()
-        result = self._do_operation("POST", "/reset", timeout=60)
+        result = self._do_operation("reset", timeout=60)
         self._cvd_group = None
         self._cvd_name = None
         return self._fmt(result)
@@ -452,7 +603,7 @@ class CvdPower(VirtualPowerInterface, Driver):
                 group = cvd.get("group", self.parent.group)
                 name = cvd.get("name", self.parent.name)
                 try:
-                    self.parent._do_operation("DELETE", f"/cvds/{group}/{name}")
+                    self.parent._do_operation("delete", None, 300, group, name)
                 except CuttlefishError:
                     self.logger.warning("Failed to delete stale CVD %s/%s", group, name)
                     failed.append(f"{group}/{name}")
@@ -478,9 +629,7 @@ class CvdPower(VirtualPowerInterface, Driver):
         else:
             self.logger.info("Creating CVD from env_config")
             try:
-                result = self.parent._do_operation(
-                    "POST", "/cvds", {"env_config": self.parent.env_config}, timeout=600,
-                )
+                result = self.parent._do_operation("create", {"env_config": self.parent.env_config}, timeout=600)
             except CuttlefishError as e:
                 msg = str(e)
                 if "in use" in msg or "already running" in msg or "ValidateTapDevices" in msg:
@@ -496,7 +645,7 @@ class CvdPower(VirtualPowerInterface, Driver):
                     actual_port = cvd.get("adb_port")
                     if actual_port and actual_port != self.parent._expected_adb_port:
                         try:
-                            self.parent._do_operation("DELETE", self.parent._cvd_path)
+                            self.parent._do_operation("delete")
                         except CuttlefishError:
                             self.logger.warning("Failed to clean up CVD after port mismatch")
                         self.parent._cvd_group = None
@@ -528,12 +677,12 @@ class CvdPower(VirtualPowerInterface, Driver):
         if destroy:
             p._auto_disconnect_adb()
             self.logger.info(f"Deleting CVD {cvd_id}")
-            p._do_operation("DELETE", p._cvd_path)
+            p._do_operation("delete")
             p._cvd_group = None
             p._cvd_name = None
         else:
             self.logger.info(f"Stopping CVD {cvd_id}")
-            p._do_operation("POST", f"{p._cvd_path}/:stop")
+            p._do_operation("stop")
 
     @export
     def read(self) -> Generator[PowerReading, None, None]:

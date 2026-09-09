@@ -432,3 +432,172 @@ func TestRelaySupervisorExitsWhenEitherRelayFails(t *testing.T) {
 		})
 	}
 }
+
+func TestRenderPod_execBackend(t *testing.T) {
+	pod := renderTestPod(t, map[string]interface{}{"fetch_images": true, "backend": "exec"})
+	endpoint := "exec://httpcvd@" + launcherSocketPath
+
+	copyExec := pod.Spec.InitContainers[0]
+	if copyExec.Name != "copy-jumpstarter-exec" || copyExec.Command[1] != jmpExecBinaryPath ||
+		copyExec.Command[2] != sharedMountPath+"/jumpstarter-exec" || copyExec.Image != pod.Spec.Containers[0].Image {
+		t.Fatalf("jumpstarter-exec must be staged from the exporter image: %#v", copyExec)
+	}
+	var runtime, gate corev1.Container
+	for _, container := range pod.Spec.InitContainers {
+		switch container.Name {
+		case "cuttlefish":
+			runtime = container
+		case "wait-for-cuttlefish":
+			gate = container
+		}
+	}
+	script := runtime.Command[2]
+	if !strings.Contains(script, "/root/run_services.sh &") ||
+		!strings.HasSuffix(script, "exec "+sharedMountPath+"/jumpstarter-exec serve --socket "+launcherSocketPath) {
+		t.Fatalf("runtime must keep the image services and serve the launcher socket as PID 1: %q", script)
+	}
+	if !strings.Contains(script, "runtime-id") {
+		t.Fatal("runtime marker must still be written in exec mode")
+	}
+	// cvd aborts when it cannot read the working directory it inherits, and the
+	// image's WORKDIR is /root (0700), so the launcher must move off it first.
+	if !strings.Contains(script, "\ncd "+launcherWorkDir+"\n") {
+		t.Fatalf("launcher must serve from a directory cvd_user can read: %q", script)
+	}
+	if !hasMount(runtime.VolumeMounts, sharedVolumeName, sharedMountPath) {
+		t.Fatalf("runtime lacks the shared volume: %#v", runtime.VolumeMounts)
+	}
+	if len(gate.Command) != 5 || gate.Command[3] != "--wait" || gate.Command[4] != endpoint ||
+		!hasMount(gate.VolumeMounts, sharedVolumeName, sharedMountPath) {
+		t.Fatalf("startup gate must wait on the launcher: %#v", gate)
+	}
+
+	exporter := pod.Spec.Containers[0]
+	if exporter.Command[6] != endpoint {
+		t.Fatalf("exporter endpoint = %q, want %q", exporter.Command[6], endpoint)
+	}
+	if !hasEnv(exporter.Env, "JUMPSTARTER_LAUNCHER_SOCKET", launcherSocketPath) {
+		t.Fatalf("exporter must learn the launcher socket for shutdown: %#v", exporter.Env)
+	}
+	if !hasMount(exporter.VolumeMounts, sharedVolumeName, sharedMountPath) {
+		t.Fatalf("exporter lacks the shared volume: %#v", exporter.VolumeMounts)
+	}
+
+	sharedFound := false
+	total := resource.MustParse("1Gi")
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name == sharedVolumeName {
+			sharedFound = true
+			if volume.EmptyDir == nil || volume.EmptyDir.SizeLimit == nil || volume.EmptyDir.SizeLimit.String() != sharedVolumeSizeLimit {
+				t.Fatalf("shared volume must be a bounded emptyDir: %#v", volume)
+			}
+		}
+		if volume.EmptyDir != nil {
+			total.Add(*volume.EmptyDir.SizeLimit)
+		}
+	}
+	if !sharedFound {
+		t.Fatal("shared volume missing")
+	}
+	if request := runtime.Resources.Requests[corev1.ResourceEphemeralStorage]; request.Cmp(total) != 0 {
+		t.Fatalf("storage budget %s does not include the shared volume (%s)", request.String(), total.String())
+	}
+}
+
+func TestRenderPod_httpBackendHasNoLauncher(t *testing.T) {
+	for _, params := range []map[string]interface{}{{"fetch_images": true}, {"fetch_images": true, "backend": "http"}} {
+		pod := renderTestPod(t, params)
+		for _, volume := range pod.Spec.Volumes {
+			if volume.Name == sharedVolumeName {
+				t.Fatal("http backend must not add the shared volume")
+			}
+		}
+		exporter := pod.Spec.Containers[0]
+		if exporter.Command[6] != fmt.Sprintf("http://127.0.0.1:%d", hostOrchestratorPort) {
+			t.Fatalf("exporter endpoint = %q", exporter.Command[6])
+		}
+		if hasEnv(exporter.Env, "JUMPSTARTER_LAUNCHER_SOCKET", launcherSocketPath) {
+			t.Fatal("http backend must not advertise a launcher socket")
+		}
+		if pod.Spec.InitContainers[0].Name == "copy-jumpstarter-exec" {
+			t.Fatal("http backend must not stage jumpstarter-exec")
+		}
+	}
+}
+
+func TestBackendValidation(t *testing.T) {
+	for _, params := range []map[string]interface{}{
+		{"backend": "grpc"}, {"backend": 1}, {"backend": ""},
+		{"backend": "exec", "cvd_user": ""}, {"backend": "exec", "cvd_user": "Bad User"}, {"backend": "exec", "cvd_user": 101},
+	} {
+		params["fetch_images"] = true
+		params["runtime_privileged"] = true
+		params["service_account_name"] = "cuttlefish-runtime"
+		if _, err := New("dev").RenderPod(context.Background(), testExporterSet(), &virtualtargetv1alpha1.VirtualTargetClass{}, params, nil, nil); err == nil {
+			t.Errorf("accepted %v", params)
+		}
+	}
+}
+
+func TestEnrichExporterExportBackends(t *testing.T) {
+	driver := virtualtargetv1alpha1.DriverConfig{Name: "cuttlefish", Type: cuttlefishDriverType}
+
+	result, err := New("dev").EnrichExporterExport([]virtualtargetv1alpha1.DriverConfig{driver}, map[string]interface{}{"backend": "exec"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := configFor(t, result[0])
+	if config["launcher_socket"] != launcherSocketPath || config["cvd_user"] != defaultCvdUser || config["managed"] != true {
+		t.Fatalf("exec backend config = %#v", config)
+	}
+	if config["host"] != "127.0.0.1" || config["port"] != float64(hostOrchestratorPort) {
+		t.Fatalf("exec backend must keep the in-Pod endpoint for WebRTC and validation: %#v", config)
+	}
+
+	result, err = New("dev").EnrichExporterExport([]virtualtargetv1alpha1.DriverConfig{driver}, map[string]interface{}{"backend": "exec", "cvd_user": "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configFor(t, result[0])["cvd_user"] != "root" {
+		t.Fatal("cvd_user override not applied")
+	}
+
+	result, err = New("dev").EnrichExporterExport([]virtualtargetv1alpha1.DriverConfig{driver}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config = configFor(t, result[0])
+	if _, exists := config["launcher_socket"]; exists {
+		t.Fatal("http backend must not inject launcher_socket")
+	}
+
+	preset := virtualtargetv1alpha1.DriverConfig{Name: "cuttlefish", Type: cuttlefishDriverType, Config: mustJSON(map[string]interface{}{"launcher_socket": "/tmp/x.sock"})}
+	if _, err := New("dev").EnrichExporterExport([]virtualtargetv1alpha1.DriverConfig{preset}, nil); err == nil {
+		t.Fatal("template-provided launcher_socket must be rejected outside the exec backend")
+	}
+	result, err = New("dev").EnrichExporterExport([]virtualtargetv1alpha1.DriverConfig{preset}, map[string]interface{}{"backend": "exec"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configFor(t, result[0])["launcher_socket"] != launcherSocketPath {
+		t.Fatal("exec backend must force the provisioner's launcher socket")
+	}
+}
+
+func hasMount(mounts []corev1.VolumeMount, name, path string) bool {
+	for _, mount := range mounts {
+		if mount.Name == name && mount.MountPath == path {
+			return true
+		}
+	}
+	return false
+}
+
+func hasEnv(env []corev1.EnvVar, name, value string) bool {
+	for _, variable := range env {
+		if variable.Name == name && variable.Value == value {
+			return true
+		}
+	}
+	return false
+}

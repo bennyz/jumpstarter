@@ -591,7 +591,9 @@ def test_managed_records_power_intent(managed_drv, operation, expected):
 
     with patch.object(managed_drv, "_perform_operation", side_effect=perform):
         getattr(managed_drv, operation)()
-    assert json.loads(Path(managed_drv.health_state_path).read_text())["state"] == expected
+    state = json.loads(Path(managed_drv.health_state_path).read_text())
+    assert state["state"] == expected
+    assert "deadline" not in state
 
 
 def test_managed_records_failed_operation(managed_drv):

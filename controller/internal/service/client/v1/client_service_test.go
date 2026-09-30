@@ -9,9 +9,11 @@ import (
 	jumpstarterdevv1alpha1 "github.com/jumpstarter-dev/jumpstarter/controller/api/v1alpha1"
 	cpb "github.com/jumpstarter-dev/jumpstarter/controller/internal/protocol/jumpstarter/client/v1"
 	"github.com/jumpstarter-dev/jumpstarter/controller/internal/service/auth"
+	"github.com/jumpstarter-dev/jumpstarter/controller/internal/service/utils"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -721,6 +723,58 @@ func TestCreateLeaseSharedWithDedupBeforeLimit(t *testing.T) {
 		st, ok := status.FromError(err)
 		if !ok || st.Code() != codes.InvalidArgument {
 			t.Fatalf("expected InvalidArgument, got %v", err)
+		}
+	})
+}
+
+func TestUpdateLeaseBeginTimeAfterStart(t *testing.T) {
+	const ns = "default"
+	begin := time.Now().Add(time.Hour).Truncate(time.Second)
+	newBegin := begin.Add(time.Hour)
+
+	scheduledLease := func(started bool) *jumpstarterdevv1alpha1.Lease {
+		lease := &jumpstarterdevv1alpha1.Lease{
+			ObjectMeta: metav1.ObjectMeta{Name: "lease", Namespace: ns},
+			Spec: jumpstarterdevv1alpha1.LeaseSpec{
+				ClientRef: corev1.LocalObjectReference{Name: "owner"},
+				BeginTime: &metav1.Time{Time: begin},
+				Duration:  &metav1.Duration{Duration: time.Hour},
+			},
+		}
+		if started {
+			lease.Status.ExporterRef = &corev1.LocalObjectReference{Name: "exporter"}
+		}
+		return lease
+	}
+	updateBeginTime := func(t *testing.T, lease *jumpstarterdevv1alpha1.Lease) error {
+		objs := append(namedClients(ns, "owner"), lease)
+		svc := authedClientService("owner", ns, testFakeClient(objs...))
+		_, err := svc.UpdateLease(context.Background(), &cpb.UpdateLeaseRequest{
+			Lease: &cpb.Lease{
+				Name:      utils.UnparseLeaseIdentifier(kclient.ObjectKey{Namespace: ns, Name: lease.Name}),
+				BeginTime: timestamppb.New(newBegin),
+				Duration:  durationpb.New(time.Hour),
+			},
+		})
+		return err
+	}
+
+	t.Run("rejects moving BeginTime once an exporter is assigned", func(t *testing.T) {
+		err := updateBeginTime(t, scheduledLease(true))
+		st, ok := status.FromError(err)
+		if !ok || st.Code() != codes.FailedPrecondition {
+			t.Fatalf("expected FailedPrecondition, got %v", err)
+		}
+		if st.Message() != "cannot update BeginTime: lease has already started" {
+			t.Fatalf("unexpected message: %q", st.Message())
+		}
+	})
+
+	// Control: the identical request succeeds before start, so the rejection above
+	// comes from the started guard and not from another validation.
+	t.Run("allows moving BeginTime before an exporter is assigned", func(t *testing.T) {
+		if err := updateBeginTime(t, scheduledLease(false)); err != nil {
+			t.Fatalf("expected update before start to succeed, got %v", err)
 		}
 	})
 }

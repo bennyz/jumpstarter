@@ -26,6 +26,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -793,5 +794,314 @@ var _ = Describe("Lease.ToProtobuf SharedWith", func() {
 
 		roundtripped := lease.ToProtobuf()
 		Expect(roundtripped.SharedWith).To(ConsistOf("alice", "bob"))
+	})
+})
+
+var _ = Describe("Lease time validation", func() {
+	When("creating lease with BeginTime + EndTime + Duration (all three specified)", func() {
+		It("should reject when Duration conflicts with EndTime - BeginTime", func() {
+			// Test through the service layer (LeaseFromProtobuf) which validates
+			beginTime := metav1.NewTime(time.Now().Truncate(time.Second).Add(1 * time.Second))
+			endTime := metav1.NewTime(beginTime.Add(1 * time.Second))
+			conflictingDuration := 2 * time.Second // Wrong! Should be 1 second
+
+			// Create via LeaseFromProtobuf to trigger validation
+			key := types.NamespacedName{Name: "test-lease", Namespace: "default"}
+			clientRef := corev1.LocalObjectReference{Name: "client"}
+
+			pbLease := &cpb.Lease{
+				Selector: "dut=a",
+			}
+			pbLease.BeginTime = timestamppb.New(beginTime.Time)
+			pbLease.EndTime = timestamppb.New(endTime.Time)
+			pbLease.Duration = durationpb.New(conflictingDuration)
+
+			lease, err := LeaseFromProtobuf(pbLease, key, clientRef)
+
+			// Should fail validation
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("duration conflicts"))
+			Expect(lease).To(BeNil())
+		})
+	})
+
+	When("creating lease with BeginTime after EndTime", func() {
+		It("should reject with validation error", func() {
+			beginTime := metav1.NewTime(time.Now().Truncate(time.Second).Add(1 * time.Second))
+			endTime := metav1.NewTime(beginTime.Add(-1 * time.Second)) // Before BeginTime!
+
+			key := types.NamespacedName{Name: "invalid-lease", Namespace: "default"}
+			clientRef := corev1.LocalObjectReference{Name: "client"}
+
+			pbLease := &cpb.Lease{
+				Selector:  "dut=a",
+				BeginTime: timestamppb.New(beginTime.Time),
+				EndTime:   timestamppb.New(endTime.Time),
+				// No duration provided - will calculate negative duration from BeginTime > EndTime
+			}
+
+			lease, err := LeaseFromProtobuf(pbLease, key, clientRef)
+
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("duration must be positive"))
+			Expect(lease).To(BeNil())
+		})
+	})
+
+	When("creating lease with BeginTime but zero Duration and no EndTime", func() {
+		It("should reject with validation error", func() {
+			beginTime := metav1.NewTime(time.Now().Truncate(time.Second).Add(1 * time.Second))
+
+			key := types.NamespacedName{Name: "invalid-lease", Namespace: "default"}
+			clientRef := corev1.LocalObjectReference{Name: "client"}
+
+			pbLease := &cpb.Lease{
+				Selector: "dut=a",
+			}
+			pbLease.BeginTime = timestamppb.New(beginTime.Time)
+			// No Duration, no EndTime
+
+			lease, err := LeaseFromProtobuf(pbLease, key, clientRef)
+
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("duration is required"))
+			Expect(lease).To(BeNil())
+		})
+	})
+
+	When("updating a lease with all three fields to create conflict", func() {
+		It("should reject updates that break consistency", func() {
+			// Start with consistent fields
+			beginTimeVal := metav1.NewTime(time.Now().Truncate(time.Second).Add(1 * time.Second))
+			beginTime := &beginTimeVal
+			duration := 500 * time.Millisecond
+			endTimeVal := metav1.NewTime(beginTimeVal.Add(duration))
+			endTime := &endTimeVal
+
+			// Try to update Duration to conflict with BeginTime and EndTime
+			conflictingDuration := &metav1.Duration{Duration: 1 * time.Second} // Wrong! EndTime-BeginTime = 500ms
+
+			// Simulate UpdateLease validation
+			err := ReconcileLeaseTimeFields(
+				&beginTime,
+				&endTime,
+				&conflictingDuration,
+			)
+
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("duration conflicts"))
+		})
+	})
+
+	When("creating lease with negative Duration", func() {
+		It("should reject with validation error", func() {
+			key := types.NamespacedName{Name: "invalid-lease", Namespace: "default"}
+			clientRef := corev1.LocalObjectReference{Name: "client"}
+
+			pbLease := &cpb.Lease{
+				Selector: "dut=a",
+			}
+			pbLease.Duration = durationpb.New(-1 * time.Second) // Negative!
+
+			lease, err := LeaseFromProtobuf(pbLease, key, clientRef)
+
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("duration must be positive"))
+			Expect(lease).To(BeNil())
+		})
+	})
+
+	When("creating lease with EndTime and negative Duration", func() {
+		It("should reject with validation error", func() {
+			key := types.NamespacedName{Name: "invalid-lease-2", Namespace: "default"}
+			clientRef := corev1.LocalObjectReference{Name: "client"}
+
+			endTime := metav1.NewTime(time.Now().Truncate(time.Second).Add(1 * time.Second))
+			pbLease := &cpb.Lease{
+				Selector: "dut=a",
+				EndTime:  timestamppb.New(endTime.Time),
+			}
+			pbLease.Duration = durationpb.New(-2 * time.Second) // Negative!
+
+			lease, err := LeaseFromProtobuf(pbLease, key, clientRef)
+
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("duration must be positive"))
+			Expect(lease).To(BeNil())
+		})
+	})
+})
+
+var _ = Describe("ClientAllowedByPolicy", func() {
+	var (
+		exporter *Exporter
+		client   *Client
+	)
+
+	BeforeEach(func() {
+		exporter = &Exporter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-exporter",
+				Namespace: "default",
+				Labels:    map[string]string{"board": "rpi4", "env": "lab"},
+			},
+		}
+		client = &Client{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-client",
+				Namespace: "default",
+				Labels:    map[string]string{"team": "devops"},
+			},
+		}
+	})
+
+	It("should allow when client matches a policy's From selector", func() {
+		policies := []ExporterAccessPolicy{{
+			Spec: ExporterAccessPolicySpec{
+				ExporterSelector: metav1.LabelSelector{
+					MatchLabels: map[string]string{"board": "rpi4"},
+				},
+				Policies: []Policy{{
+					From: []From{{
+						ClientSelector: metav1.LabelSelector{
+							MatchLabels: map[string]string{"team": "devops"},
+						},
+					}},
+				}},
+			},
+		}}
+
+		allowed, err := ClientAllowedByPolicy(policies, exporter, client)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(allowed).To(BeTrue())
+	})
+
+	It("should deny when client labels don't match any From selector", func() {
+		policies := []ExporterAccessPolicy{{
+			Spec: ExporterAccessPolicySpec{
+				ExporterSelector: metav1.LabelSelector{
+					MatchLabels: map[string]string{"board": "rpi4"},
+				},
+				Policies: []Policy{{
+					From: []From{{
+						ClientSelector: metav1.LabelSelector{
+							MatchLabels: map[string]string{"team": "security"},
+						},
+					}},
+				}},
+			},
+		}}
+
+		allowed, err := ClientAllowedByPolicy(policies, exporter, client)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(allowed).To(BeFalse())
+	})
+
+	It("should deny when exporter labels don't match any policy", func() {
+		policies := []ExporterAccessPolicy{{
+			Spec: ExporterAccessPolicySpec{
+				ExporterSelector: metav1.LabelSelector{
+					MatchLabels: map[string]string{"board": "jetson"},
+				},
+				Policies: []Policy{{
+					From: []From{{
+						ClientSelector: metav1.LabelSelector{
+							MatchLabels: map[string]string{"team": "devops"},
+						},
+					}},
+				}},
+			},
+		}}
+
+		allowed, err := ClientAllowedByPolicy(policies, exporter, client)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(allowed).To(BeFalse())
+	})
+
+	It("should deny when no policies are supplied (callers short-circuit this case)", func() {
+		allowed, err := ClientAllowedByPolicy(nil, exporter, client)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(allowed).To(BeFalse())
+		allowed, err = ClientAllowedByPolicy([]ExporterAccessPolicy{}, exporter, client)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(allowed).To(BeFalse())
+	})
+
+	It("should error when a policy has a malformed exporter selector", func() {
+		policies := []ExporterAccessPolicy{{
+			Spec: ExporterAccessPolicySpec{
+				ExporterSelector: metav1.LabelSelector{
+					MatchExpressions: []metav1.LabelSelectorRequirement{{
+						Key:      "board",
+						Operator: "InvalidOperator",
+						Values:   []string{"rpi4"},
+					}},
+				},
+			},
+		}}
+
+		_, err := ClientAllowedByPolicy(policies, exporter, client)
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("should error when a policy has a malformed client selector", func() {
+		policies := []ExporterAccessPolicy{{
+			Spec: ExporterAccessPolicySpec{
+				ExporterSelector: metav1.LabelSelector{
+					MatchLabels: map[string]string{"board": "rpi4"},
+				},
+				Policies: []Policy{{
+					From: []From{{
+						ClientSelector: metav1.LabelSelector{
+							MatchExpressions: []metav1.LabelSelectorRequirement{{
+								Key:      "team",
+								Operator: "InvalidOperator",
+								Values:   []string{"devops"},
+							}},
+						},
+					}},
+				}},
+			},
+		}}
+
+		_, err := ClientAllowedByPolicy(policies, exporter, client)
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("should allow when any one of multiple policies matches", func() {
+		policies := []ExporterAccessPolicy{
+			{
+				Spec: ExporterAccessPolicySpec{
+					ExporterSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{"board": "jetson"},
+					},
+					Policies: []Policy{{
+						From: []From{{
+							ClientSelector: metav1.LabelSelector{
+								MatchLabels: map[string]string{"team": "devops"},
+							},
+						}},
+					}},
+				},
+			},
+			{
+				Spec: ExporterAccessPolicySpec{
+					ExporterSelector: metav1.LabelSelector{
+						MatchLabels: map[string]string{"board": "rpi4"},
+					},
+					Policies: []Policy{{
+						From: []From{{
+							ClientSelector: metav1.LabelSelector{
+								MatchLabels: map[string]string{"team": "devops"},
+							},
+						}},
+					}},
+				},
+			},
+		}
+
+		allowed, err := ClientAllowedByPolicy(policies, exporter, client)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(allowed).To(BeTrue())
 	})
 })

@@ -342,21 +342,31 @@ class ReportStatusRequest(google.protobuf.message.Message):
     STATUS_FIELD_NUMBER: builtins.int
     MESSAGE_FIELD_NUMBER: builtins.int
     RELEASE_LEASE_FIELD_NUMBER: builtins.int
+    LEASE_NAME_FIELD_NUMBER: builtins.int
     status: jumpstarter.v1.common_pb2.ExporterStatus.ValueType
     """Current exporter status."""
     message: builtins.str
     """Optional human-readable status message."""
     release_lease: builtins.bool
     """When true, controller should release the active lease."""
+    lease_name: builtins.str
+    """Originating lease, captured before enqueueing/retrying the report. An explicit
+    empty value reports unleased startup/shutdown. Omission retains legacy,
+    unfenced behavior; both peers must be upgraded for lease fencing.
+    Once LeaseRef is cleared, only cleanup statuses for a named lease are accepted.
+    """
     def __init__(
         self,
         *,
         status: jumpstarter.v1.common_pb2.ExporterStatus.ValueType = ...,
         message: builtins.str | None = ...,
         release_lease: builtins.bool | None = ...,
+        lease_name: builtins.str | None = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["_message", b"_message", "_release_lease", b"_release_lease", "message", b"message", "release_lease", b"release_lease"]) -> builtins.bool: ...
-    def ClearField(self, field_name: typing.Literal["_message", b"_message", "_release_lease", b"_release_lease", "message", b"message", "release_lease", b"release_lease", "status", b"status"]) -> None: ...
+    def HasField(self, field_name: typing.Literal["_lease_name", b"_lease_name", "_message", b"_message", "_release_lease", b"_release_lease", "lease_name", b"lease_name", "message", b"message", "release_lease", b"release_lease"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["_lease_name", b"_lease_name", "_message", b"_message", "_release_lease", b"_release_lease", "lease_name", b"lease_name", "message", b"message", "release_lease", b"release_lease", "status", b"status"]) -> None: ...
+    @typing.overload
+    def WhichOneof(self, oneof_group: typing.Literal["_lease_name", b"_lease_name"]) -> typing.Literal["lease_name"] | None: ...
     @typing.overload
     def WhichOneof(self, oneof_group: typing.Literal["_message", b"_message"]) -> typing.Literal["message"] | None: ...
     @typing.overload

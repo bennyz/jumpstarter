@@ -551,6 +551,86 @@ def _setup_mock_controller_stub(exporter, side_effect=None):
 
 
 class TestReportStatusGrpcErrorHandling:
+    async def test_cleanup_reports_the_ended_lease(self):
+        exporter = _make_exporter_for_report_status()
+        lease = make_lease_context("lease-a")
+        lease.before_lease_hook.set()
+        lease.lease_ended.set()
+        exporter._lease_context = lease
+        exporter._status_drain_active = True
+
+        await exporter._cleanup_after_lease(lease)
+
+        request = exporter._pending_status_request
+        assert request.lease_name == "lease-a"
+        assert request.status == ExporterStatus.AVAILABLE.to_proto()
+        assert lease.after_lease_hook_done.is_set()
+
+    @pytest.mark.parametrize("lease_name", [None, "lease-a"])
+    @pytest.mark.parametrize("status", [ExporterStatus.AVAILABLE, ExporterStatus.OFFLINE, ExporterStatus.LEASE_READY])
+    async def test_report_captures_identity_before_enqueue(self, lease_name, status):
+        exporter = _make_exporter_for_report_status()
+        exporter._status_drain_active = True
+        if lease_name:
+            exporter._lease_context = make_lease_context(lease_name)
+            exporter._lease_context.lease_ended.set()
+
+        await exporter._report_status(status, "snapshot")
+        request = exporter._pending_status_request
+        exporter._lease_context = make_lease_context("lease-b")
+
+        assert request.HasField("lease_name")
+        assert request.lease_name == (lease_name or "")
+        assert request.status == status.to_proto()
+
+    async def test_report_retry_preserves_originating_lease(self):
+        exporter = _make_exporter_for_report_status()
+        exporter._lease_context = make_lease_context("lease-a")
+        identities = []
+
+        async def report(request, **kwargs):
+            identities.append(request.lease_name)
+            if len(identities) == 1:
+                exporter._lease_context = make_lease_context("lease-b")
+                raise grpc.aio.AioRpcError(
+                    grpc.StatusCode.DEADLINE_EXCEEDED, grpc.aio.Metadata(), grpc.aio.Metadata(), "ambiguous timeout"
+                )
+
+        _, stub = _setup_mock_controller_stub(exporter, side_effect=report)
+        with patch.object(exporter, "_controller_stub", return_value=stub), patch("anyio.sleep", new=AsyncMock()):
+            await exporter._report_status(ExporterStatus.AVAILABLE)
+
+        assert identities == ["lease-a", "lease-a"]
+
+    async def test_compat_release_uses_explicit_identity(self):
+        exporter = _make_exporter_for_report_status()
+        exporter._lease_context = make_lease_context("lease-b")
+        exporter._send_report_status_rpc = AsyncMock(return_value=True)
+
+        await exporter._send_compat_release("lease-a")
+
+        request = exporter._send_report_status_rpc.call_args.args[0]
+        assert request.lease_name == "lease-a"
+        assert request.release_lease
+
+    async def test_stale_report_does_not_block_next_report(self):
+        exporter = _make_exporter_for_report_status()
+        exporter._lease_context = make_lease_context("lease-a")
+        stale = grpc.aio.AioRpcError(
+            grpc.StatusCode.FAILED_PRECONDITION, grpc.aio.Metadata(), grpc.aio.Metadata(), "obsolete lease"
+        )
+        controller, stub = _setup_mock_controller_stub(exporter, side_effect=[stale, None])
+        with (
+            patch.object(exporter, "_controller_stub", return_value=stub),
+            patch("anyio.sleep", new=AsyncMock()) as sleep,
+        ):
+            await exporter._report_status(ExporterStatus.AVAILABLE)
+            exporter._lease_context = make_lease_context("lease-b")
+            await exporter._report_status(ExporterStatus.LEASE_READY)
+
+        assert [call.args[0].lease_name for call in controller.ReportStatus.call_args_list] == ["lease-a", "lease-b"]
+        sleep.assert_not_called()
+
     async def test_unimplemented_grpc_error_logs_warning(self, caplog):
         """When ReportStatus returns UNIMPLEMENTED, a warning is logged
         instead of an error."""

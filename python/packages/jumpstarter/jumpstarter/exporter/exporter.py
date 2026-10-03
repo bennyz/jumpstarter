@@ -716,12 +716,14 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         ok, code = await self._retry_rpc(
             lambda ctrl: ctrl.ReportStatus(request, timeout=_RPC_TIMEOUT),
             "report status",
-            non_retryable_codes=frozenset({grpc.StatusCode.UNIMPLEMENTED}),
+            non_retryable_codes=frozenset({grpc.StatusCode.UNIMPLEMENTED, grpc.StatusCode.FAILED_PRECONDITION}),
         )
         if not ok and code == grpc.StatusCode.UNIMPLEMENTED:
             # Legacy support: ReportStatus added Nov 2025 (commit b76f6c87).
             # All production controllers support it; safe to remove in future versions.
             logger.warning("ReportStatus not supported by controller, status updates will be skipped")
+        elif not ok and code == grpc.StatusCode.FAILED_PRECONDITION:
+            logger.debug("Controller rejected obsolete status report for lease %s", request.lease_name)
         return ok
 
     async def _drain_status_reports(self):
@@ -759,6 +761,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         request = jumpstarter_pb2.ReportStatusRequest(
             status=status.to_proto(),
             message=message,
+            lease_name=self._lease_context.lease_name if self._lease_context else "",
         )
 
         if self._status_drain_active:
@@ -789,6 +792,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
                 status=release_status.to_proto(),
                 message="Lease released (compat: ReportStatus with release_lease)",
                 release_lease=True,
+                lease_name=lease_name,
             )
         ):
             logger.info("Requested controller to release lease %s (compat path)", lease_name)

@@ -63,6 +63,7 @@ import (
 	k8suuid "k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -397,18 +398,28 @@ func (s *ControllerService) ReportStatus(
 
 	logger.Info("Exporter reporting status", "state", exporterStatus, "message", req.GetMessage())
 
-	original := client.MergeFrom(exporter.DeepCopy())
-
-	exporter.Status.ExporterStatusValue = exporterStatus
-	exporter.Status.StatusMessage = req.GetMessage()
-	// Also update LastSeen to keep the exporter marked as online
-	exporter.Status.LastSeen = metav1.Now()
-
-	// Sync the Online condition with the reported status for consistency
-	// This ensures the deprecated Online boolean field stays consistent with ExporterStatusValue
-	syncOnlineConditionWithStatus(exporter)
-
-	if err := s.Client.Status().Patch(ctx, exporter, original); err != nil {
+	key := client.ObjectKeyFromObject(exporter)
+	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		exporter = &jumpstarterdevv1alpha1.Exporter{}
+		if err := s.Client.Get(ctx, key, exporter); err != nil {
+			return err
+		}
+		if err := checkReportLease(exporter, req); err != nil {
+			return err
+		}
+		// LeaseRef and the status share a resource version. A reassignment after
+		// this read must conflict, and every retry must check the identity again.
+		original := client.MergeFromWithOptions(exporter.DeepCopy(), client.MergeFromWithOptimisticLock{})
+		exporter.Status.ExporterStatusValue = exporterStatus
+		exporter.Status.StatusMessage = req.GetMessage()
+		exporter.Status.LastSeen = metav1.Now()
+		syncOnlineConditionWithStatus(exporter)
+		return s.Client.Status().Patch(ctx, exporter, original)
+	})
+	if err != nil {
+		if status.Code(err) == codes.FailedPrecondition {
+			return nil, err
+		}
 		logger.Error(err, "unable to update exporter status")
 		return nil, status.Errorf(codes.Internal, "unable to update exporter status: %s", err)
 	}
@@ -418,6 +429,7 @@ func (s *ControllerService) ReportStatus(
 	// the afterLease hook completes, ensuring leases are always released even if
 	// the client disconnects unexpectedly.
 	if req.GetReleaseLease() {
+		// Use the identity from the successful write, never a later assignment.
 		if err := s.handleExporterLeaseRelease(ctx, exporter); err != nil {
 			logger.Error(err, "failed to release lease for exporter")
 			// Don't fail the status report, just log the error
@@ -426,6 +438,35 @@ func (s *ControllerService) ReportStatus(
 	}
 
 	return &pb.ReportStatusResponse{}, nil
+}
+
+func checkReportLease(exporter *jumpstarterdevv1alpha1.Exporter, req *pb.ReportStatusRequest) error {
+	// Presence distinguishes old exporters from new exporters explicitly
+	// reporting without a lease. Legacy reports retain their unfenced behavior.
+	if req.LeaseName == nil {
+		return nil
+	}
+	if exporter.Status.LeaseRef != nil {
+		if req.GetLeaseName() == exporter.Status.LeaseRef.Name {
+			return nil
+		}
+		return status.Error(codes.FailedPrecondition, "status report does not match the assigned lease")
+	}
+	if req.GetLeaseName() == "" {
+		if !req.GetReleaseLease() && (req.Status == pb.ExporterStatus_EXPORTER_STATUS_AVAILABLE ||
+			req.Status == pb.ExporterStatus_EXPORTER_STATUS_OFFLINE) {
+			return nil
+		}
+	} else {
+		// LeaseRef can disappear before afterLease runs. Permit cleanup while
+		// idle, but never resurrect an ended lease's setup/readiness state.
+		switch req.Status {
+		case pb.ExporterStatus_EXPORTER_STATUS_AVAILABLE, pb.ExporterStatus_EXPORTER_STATUS_OFFLINE,
+			pb.ExporterStatus_EXPORTER_STATUS_AFTER_LEASE_HOOK, pb.ExporterStatus_EXPORTER_STATUS_AFTER_LEASE_HOOK_FAILED:
+			return nil
+		}
+	}
+	return status.Error(codes.FailedPrecondition, "status report requires an assigned lease")
 }
 
 // handleExporterLeaseRelease handles a lease release request from an exporter.

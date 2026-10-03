@@ -117,6 +117,11 @@ message ReportStatusRequest {
   ExporterStatus status = 1; // Current exporter status.
   optional string message = 2; // Optional human-readable status message.
   optional bool release_lease = 3; // When true, controller should release the active lease.
+  // Originating lease, captured before enqueueing/retrying the report. An explicit
+  // empty value reports unleased startup/shutdown. Omission retains legacy,
+  // unfenced behavior; both peers must be upgraded for lease fencing.
+  // Once LeaseRef is cleared, only cleanup statuses for a named lease are accepted.
+  optional string lease_name = 4;
 }
 
 // Response to a status report request.

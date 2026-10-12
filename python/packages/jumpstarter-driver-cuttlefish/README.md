@@ -233,6 +233,10 @@ so the command fails if that local port is taken.
 The display vhost accepts only local Host headers and same-origin browser
 requests; native programs on the same computer can still use the local port.
 
+Open the URL in Firefox or Chrome. Safari loads the page and shows the display
+chips, but leaves the video black even though the session is healthy, so the
+result looks like an Android that failed to boot.
+
 This requires `webrtc_turn: true` on the ExporterSet; without it the driver has
 no `webui`/`turn` children and the command says so.
 

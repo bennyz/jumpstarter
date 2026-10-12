@@ -344,6 +344,13 @@ The vhost rejects non-local Host headers, cross-site browser requests, and
 Origins that differ from the forwarded UI URL. The local forward is still
 accessible to native processes on the same computer.
 
+Use Firefox or Chrome. Safari loads the client page and turns the display
+chips green, but never renders video. Nothing on the Pod side distinguishes
+that state from a working session: the streamer creates its encoders, ICE
+reaches `Completed`, and the data channels open, so the black display is easy
+to misread as a failed boot. Confirmed on macOS with the same lease rendering
+correctly in Firefox.
+
 | Parameter | Description | Default |
 | --- | --- | --- |
 | `webrtc_turn` | Enable the in-Pod TURN relay and display vhost | `false` |

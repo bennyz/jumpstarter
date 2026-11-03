@@ -231,6 +231,17 @@ class ExporterConfigV1Alpha1(BaseModel):
         default=False,
         alias="exitOnLeaseEnd",
     )
+    stop_grace: float = Field(
+        default=25.0,
+        gt=0,
+        alias="stopGrace",
+        description=(
+            "Seconds a running lease hook may continue after the exporter is asked to stop "
+            "(default: 25). Counted from the first stop signal and shared by the hooks that run "
+            "after it; keep it below the service manager's stop timeout (podman: 10 s by default, "
+            "Kubernetes: 30 s, systemd: 90 s). A second stop signal skips what is left of it."
+        ),
+    )
 
     path: Path | None = Field(default=None)
 
@@ -454,6 +465,7 @@ class ExporterConfigV1Alpha1(BaseModel):
                 hook_executor=hook_executor,
                 motd=self.motd,
                 exit_on_lease_end=self.exit_on_lease_end,
+                stop_grace=self.stop_grace,
                 status_stream_retry_timeout=self.status_stream_retry_timeout,
                 on_token_rotated=token_rotated,
             )

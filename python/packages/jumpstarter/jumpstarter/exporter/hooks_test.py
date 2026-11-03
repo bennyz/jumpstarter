@@ -1791,10 +1791,10 @@ class TestBeforeLeaseHookLeaseEndedGuard:
             "skip_after_lease_hook must be set when beforeLease hook is skipped (warn)"
         )
 
-    async def test_wait_for_lease_ready_times_out_when_session_never_populated(self) -> None:
-        """When is_ready() never becomes True and lease_ended is never set,
-        _wait_for_lease_ready must time out, report BEFORE_LEASE_HOOK_FAILED,
-        and set before_lease_hook to unblock downstream."""
+    async def test_lease_without_a_session_fails_setup_at_once(self) -> None:
+        """Setup only starts once the lease's session is serving; without one,
+        the check reports BEFORE_LEASE_HOOK_FAILED at once and unblocks
+        downstream instead of waiting."""
         import anyio
 
         from jumpstarter.exporter.lease_context import LeaseContext
@@ -1816,13 +1816,7 @@ class TestBeforeLeaseHookLeaseEndedGuard:
         async def mock_report_status(status, msg):
             status_calls.append((status, msg))
 
-        # Make sleep instant so the 30s timeout fires immediately
-        # without blocking the test for 30 real seconds.
-        async def instant_sleep(_delay):
-            pass
-
-        with patch("jumpstarter.exporter.hooks.anyio.sleep", side_effect=instant_sleep):
-            result = await executor._wait_for_lease_ready(lease_scope, mock_report_status)
+        result = await executor._check_lease_ready(lease_scope, mock_report_status)
 
         assert result is False
         assert any(
@@ -1831,10 +1825,10 @@ class TestBeforeLeaseHookLeaseEndedGuard:
         ), f"Expected BEFORE_LEASE_HOOK_FAILED, got: {status_calls}"
         assert lease_scope.before_lease_hook.is_set()
 
-    async def test_run_before_lease_hook_skips_when_lease_ended_during_is_ready_wait(self) -> None:
+    async def test_run_before_lease_hook_skips_when_lease_ended_before_session(self) -> None:
         """When lease_ended is set before the session is created (is_ready()
         returns False), the hook must bail out immediately without waiting
-        for the full is_ready timeout."""
+        for a session."""
         from anyio import Event
 
         from jumpstarter.exporter.lease_context import LeaseContext

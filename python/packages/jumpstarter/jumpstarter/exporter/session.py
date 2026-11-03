@@ -447,9 +447,9 @@ class Session(
             )
 
         # Signal that the client wants to end the session
-        # The afterLease hook will run asynchronously via _handle_end_session
+        # The exporter lifecycle runs the afterLease hook
         logger.debug("Setting end_session_requested event...")
-        self.lease_context.end_session_requested.set()
+        self.lease_context.request_end_session()
         logger.debug("end_session_requested event SET, returning response")
 
         # Return immediately - don't wait for afterLease hook

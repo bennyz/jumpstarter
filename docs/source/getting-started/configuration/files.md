@@ -123,6 +123,7 @@ motd: | # Optional message of the day shown to clients when they enter a shell
   Welcome to myexporter!
   Flash the device with: j storage flash
 statusStreamRetryTimeout: 1800 # Retry time after Status fails or ends (default: 1800s)
+stopGrace: 25 # Seconds a running lease hook may continue after a stop signal (default: 25s)
 export: # Configure drivers to expose to the clients
   power:
     type: "jumpstarter_driver_power.driver.PduPower" # The driver Python class path and type

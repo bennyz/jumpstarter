@@ -4,6 +4,7 @@ This module provides a clean abstraction for managing the lifecycle of resources
 associated with a lease, including the session, socket path, and synchronization events.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -25,8 +26,8 @@ class LeaseContext:
 
     Attributes:
         lease_name: Name of the current lease assigned by the controller
-        session: The Session object managing the device and gRPC services (set in handle_lease)
-        socket_path: Unix socket path where the session is serving (set in handle_lease)
+        session: The Session object managing the device and gRPC services (set when the lease's session opens)
+        socket_path: Unix socket path where the session is serving (set when the lease's session opens)
         hook_socket_path: Separate Unix socket for hook j commands to avoid SSL frame corruption
         before_lease_hook: Event that signals when before-lease hook completes
         end_session_requested: Event that signals when client requests end session (to run afterLease hook)
@@ -51,11 +52,19 @@ class LeaseContext:
     current_status: ExporterStatus = field(default=ExporterStatus.AVAILABLE)
     status_message: str = field(default="")
     skip_after_lease_hook: bool = False
+    notify: Callable[[], None] | None = field(default=None, repr=False)
+    """Wakes the exporter lifecycle; called after setting a lease-local flag."""
 
     def __post_init__(self):
         """Validate that required resources are present."""
         assert self.before_lease_hook is not None, "LeaseScope requires a before_lease_hook event"
         assert self.lease_name, "LeaseScope requires a non-empty lease_name"
+
+    def request_end_session(self) -> None:
+        """The client asked to end its session (EndSession RPC)."""
+        self.end_session_requested.set()
+        if self.notify is not None:
+            self.notify()
 
     def is_ready(self) -> bool:
         """Check if the lease scope has been fully initialized with session and socket.

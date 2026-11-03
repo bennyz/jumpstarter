@@ -5,7 +5,7 @@ import os
 import signal
 import threading
 import types
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -367,3 +367,57 @@ def test_drains_pending_token_after_child_exit(monkeypatch):
     assert not supervisor.is_alive()
     assert result["code"] == 75
     assert config.token == "last-rotated-token"
+
+
+class _SignalProbe:
+    """Exporter stand-in whose serve() signals its own process and records stop() calls."""
+
+    def __init__(self, plan):
+        self.plan = plan
+        self.stops: list[bool] = []  # wait_for_lease_exit of each call
+        self.exit_code = None
+
+    def stop(self, wait_for_lease_exit=False, should_unregister=False, exit_code=None):
+        self.stops.append(wait_for_lease_exit)
+
+    async def serve(self):
+        import anyio
+
+        for delay, sig in self.plan:
+            await anyio.sleep(delay)
+            os.kill(os.getpid(), sig)
+        await anyio.sleep(0.3)
+
+
+class _ProbeConfig:
+    def __init__(self, exporter):
+        self.exporter = exporter
+
+    @asynccontextmanager
+    async def create_exporter(self, **kwargs):
+        yield self.exporter
+
+
+@pytest.mark.parametrize(
+    "plan, stops",
+    [
+        pytest.param([(0, signal.SIGTERM), (0.05, signal.SIGTERM)], [False], id="repeat-within-window-is-one-stop"),
+        pytest.param([(0, signal.SIGTERM), (0.4, signal.SIGTERM)], [False, False], id="second-stop-forces"),
+        pytest.param([(0, signal.SIGHUP), (0.05, signal.SIGTERM)], [True, False], id="stop-overrides-drain"),
+        pytest.param([(0, signal.SIGHUP), (0.05, signal.SIGHUP)], [True, True], id="drain-repeats-are-harmless"),
+    ],
+)
+def test_stop_signals_reach_the_exporter(monkeypatch, plan, stops):
+    """systemd signals the whole cgroup and the parent forwards too, so one
+    stop can arrive twice within milliseconds: that is one stop. A later one
+    asks the exporter to stop immediately."""
+    monkeypatch.setattr(run_mod, "_REPEAT_SIGNAL_WINDOW", 0.2)
+    monkeypatch.setattr(run_mod, "start_metrics_server", lambda _addr: ("probe", None))
+    probe = _SignalProbe(plan)
+    with _restore_signal_handlers(), pytest.raises(SystemExit) as exited:
+        run_mod._handle_child(_ProbeConfig(probe))
+    assert probe.stops == stops
+    # A stop signal decides the exit code; a drain alone exits 128+SIGHUP, never
+    # 0, which the supervisor would take as a request to restart the exporter.
+    stop_signals = [sig for _, sig in plan if sig != signal.SIGHUP]
+    assert exited.value.code == 128 + (stop_signals[0] if stop_signals else signal.SIGHUP)

@@ -247,6 +247,31 @@ followed by `SIGKILL` if the process does not exit within a few seconds. The
 resulting failure is then handled according to the `onFailure` setting, exactly
 as if the script had exited with a non-zero exit code.
 
+### Stopping the Exporter
+
+How a running {term}`hook` is treated depends on how the {term}`exporter` is asked
+to stop:
+
+- `SIGHUP` drains: the current lease runs to its end, including its `afterLease`
+  {term}`hook`, and the {term}`exporter` then exits without taking another lease.
+- `SIGTERM`, `SIGINT` or `SIGQUIT` stops now. Waiting for the lease to end stops
+  at once. A {term}`hook` that is already running may continue for `stopGrace`
+  seconds (default `25`), counted from the signal and shared by every
+  {term}`hook` that runs after it, and is then terminated like a timed-out
+  {term}`hook`. A lease that was being served still runs its `afterLease`
+  {term}`hook` within that grace.
+- A second stop signal stops immediately and skips what is left of the grace. A
+  repeat within one second counts as the same stop: `systemd` signals every
+  process in the unit, and `jmp run` also forwards the signal to the exporter.
+
+Keep `stopGrace` below the service manager's stop timeout: 10 seconds for
+`podman stop`, 30 seconds for Kubernetes and 90 seconds for `systemd` by default.
+
+From the moment it is asked to stop, or from the start of its last lease when
+`exitOnLeaseEnd` is set, the {term}`exporter` never reports `AVAILABLE` to the
+controller, so no further lease is assigned to it. A client that ends its session
+still sees `AVAILABLE` once its `afterLease` {term}`hook` is done.
+
 ## Use Cases
 
 ### Device Initialization

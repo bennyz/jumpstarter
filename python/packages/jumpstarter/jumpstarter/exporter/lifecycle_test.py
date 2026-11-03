@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from ipaddress import IPv4Address
 from pathlib import Path
+from typing import Literal
 
 import anyio
 import grpc
@@ -25,7 +26,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from jumpstarter_protocol import jumpstarter_pb2, jumpstarter_pb2_grpc, router_pb2_grpc
 
-from jumpstarter.common import ExporterStatus
+from jumpstarter.common import ExporterStatus, LeaseHookPhase
 from jumpstarter.config.exporter import HookConfigV1Alpha1, HookInstanceConfigV1Alpha1
 from jumpstarter.driver import Driver
 from jumpstarter.exporter.exporter import Exporter
@@ -90,21 +91,39 @@ class FakeController(jumpstarter_pb2_grpc.ControllerServiceServicer):
     registered: int = 0
     unregistered: int = 0
     release_ends_lease: bool = True
-
     router_endpoint: str = ""
+    records: bool = False
+    """Keep a lease hook record (#1208): Status carries it, UpdateLeaseHooks writes it."""
+    record: jumpstarter_pb2.LeaseHooks = field(default_factory=jumpstarter_pb2.LeaseHooks)
+    record_writes: list[tuple[str, str, LeaseHookPhase, int]] = field(default_factory=list)
+    assigned: tuple[str, str, str] | None = None  # (lease, uid, client)
 
     def __post_init__(self):
         self._status_tx, self._status_rx = create_memory_object_stream[jumpstarter_pb2.StatusResponse](64)
         self._dial_tx, self._dial_rx = create_memory_object_stream[str](64)
 
+    def _status(self) -> jumpstarter_pb2.StatusResponse:
+        status = jumpstarter_pb2.StatusResponse(leased=False)
+        if self.assigned is not None:
+            lease, uid, client = self.assigned
+            status = jumpstarter_pb2.StatusResponse(leased=True, lease_name=lease, client_name=client)
+            if self.records:
+                status.lease_uid = uid
+        if self.records:
+            status.lease_hooks.CopyFrom(self.record)
+        return status
+
     # --- driving the exporter -------------------------------------------------
     def assign(self, lease: str, client: str = "client-a") -> None:
-        self._status_tx.send_nowait(
-            jumpstarter_pb2.StatusResponse(leased=True, lease_name=lease, client_name=client)
-        )
+        self.assigned = (lease, f"uid-{lease}", client)
+        self._status_tx.send_nowait(self._status())
 
     def unassign(self) -> None:
-        self._status_tx.send_nowait(jumpstarter_pb2.StatusResponse(leased=False))
+        self.assigned = None
+        self._status_tx.send_nowait(self._status())
+
+    def hook_phase(self, hook: Literal["before_lease", "after_lease"]) -> LeaseHookPhase | None:
+        return LeaseHookPhase(getattr(self.record, hook).phase) if self.record.HasField(hook) else None
 
     def dial(self, token: str) -> None:
         """A client dials the current lease; the exporter hears it on Listen."""
@@ -147,8 +166,39 @@ class FakeController(jumpstarter_pb2_grpc.ControllerServiceServicer):
     async def GetServiceEndpoints(self, request, context):
         await context.abort(grpc.StatusCode.UNIMPLEMENTED, "no telemetry")
 
+    async def UpdateLeaseHooks(self, request, context):
+        """The controller's record rules, as in #1208: only the assigned lease starts setup,
+        an outcome must match the running attempt, a new lease replaces the record."""
+        if not self.records:
+            await context.abort(grpc.StatusCode.UNIMPLEMENTED, "no hook records")
+        hook = "before_lease" if request.HasField("before_lease") else "after_lease"
+        state = getattr(request, hook)
+        phase = LeaseHookPhase(state.phase)
+        assigned = self.assigned is not None and self.assigned[:2] == (request.lease_name, request.lease_uid)
+        starting = phase in (LeaseHookPhase.RUNNING, LeaseHookPhase.SKIPPED)
+        if hook == "before_lease" and starting and not assigned:
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "lease is not assigned")
+        if request.lease_uid != self.record.lease_uid:
+            if not (hook == "before_lease" and starting and assigned):
+                await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "no record of this lease")
+            assert self.assigned is not None
+            self.record = jumpstarter_pb2.LeaseHooks(
+                lease_name=request.lease_name, lease_uid=request.lease_uid, client_name=self.assigned[2]
+            )
+        current = getattr(self.record, hook) if self.record.HasField(hook) else None
+        if phase in (LeaseHookPhase.SUCCEEDED, LeaseHookPhase.FAILED) and current is not None and (
+            current.phase != LeaseHookPhase.RUNNING or current.attempts != state.attempts
+        ):
+            await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "outcome of an attempt that is not running")
+        getattr(self.record, hook).CopyFrom(state)
+        self.record_writes.append((request.lease_name, hook, phase, state.attempts))
+        return self.record
+
     async def Status(self, request, context):
+        yield self._status()  # the current state as the stream opens, as the controller does
         async for status in self._status_rx:
+            if self.records:  # always the latest record, whenever the message was queued
+                status.lease_hooks.CopyFrom(self.record)
             yield status
 
     async def Listen(self, request, context):
@@ -156,10 +206,28 @@ class FakeController(jumpstarter_pb2_grpc.ControllerServiceServicer):
             yield jumpstarter_pb2.ListenResponse(router_endpoint=self.router_endpoint, router_token=token)
 
 
-def hook(log: Path, tag: str, *, sleep: float = 0, exit_code: int = 0, on_failure="warn", timeout=60):
+def hook(
+    log: Path, tag: str, *, sleep: float = 0, exit_code: int = 0, on_failure="warn", timeout=60,
+    sleep_first: float = 0, on_interrupt="rerun",
+):
+    """A hook that logs its run. sleep_first: sleep this long on its first run only."""
     stamp = log.parent / f"{tag}.start"
-    script = f'date +%s.%N > {stamp}; echo "{tag} $LEASE_NAME" >> {log}; sleep {sleep}; exit {exit_code}'
-    return HookInstanceConfigV1Alpha1(script=script, timeout=timeout, on_failure=on_failure)
+    first = log.parent / f"{tag}.first"
+    once = f"if [ ! -e {first} ]; then touch {first}; sleep {sleep_first}; fi; " if sleep_first else ""
+    script = f'date +%s.%N > {stamp}; echo "{tag} $LEASE_NAME" >> {log}; {once}sleep {sleep}; exit {exit_code}'
+    return HookInstanceConfigV1Alpha1(
+        script=script, timeout=timeout, on_failure=on_failure, on_interrupt=on_interrupt,
+    )
+
+
+def session_socket(exporter: Exporter) -> str:
+    """The current lease's client socket; the one place that knows an implementation's internals."""
+    lease = getattr(exporter, "_lease_context", None)
+    fsm = getattr(exporter, "fsm", None)  # the typed-FSM variant (#1273)
+    if lease is None and fsm is not None and fsm.runner is not None:
+        lease = getattr(fsm.runner.current_state, "lease", None)
+    assert lease is not None and lease.socket_path, "no lease session"
+    return lease.socket_path
 
 
 @dataclass
@@ -191,8 +259,14 @@ class Harness:
 
 
 @asynccontextmanager
-async def running(tmp_path, *, before=None, after=None, exit_on_lease_end=False, stop_grace=None):
-    controller = FakeController()
+async def running(
+    tmp_path, *, before=None, after=None, exit_on_lease_end=False, stop_grace=None, records=False, controller=None,
+):
+    """One exporter process against a fake controller. Pass a previous run's
+    controller to start the next process of the same exporter against it."""
+    reused = controller is not None
+    controller = controller or FakeController(records=records)
+    registered_before = controller.registered
     router = FakeRouter()
     server = grpc.aio.server()
     port = server.add_insecure_port("127.0.0.1:0")
@@ -210,7 +284,7 @@ async def running(tmp_path, *, before=None, after=None, exit_on_lease_end=False,
     saved_insecure = os.environ.get("JUMPSTARTER_GRPC_INSECURE")
     os.environ["JUMPSTARTER_GRPC_INSECURE"] = "1"
 
-    async def channel_factory(token: str) -> grpc.aio.Channel:
+    async def channel_factory(token: str = "") -> grpc.aio.Channel:  # older exporters pass no token
         return grpc.aio.insecure_channel(f"127.0.0.1:{port}")
 
     executor = None
@@ -238,7 +312,12 @@ async def running(tmp_path, *, before=None, after=None, exit_on_lease_end=False,
     try:
         async with create_task_group() as tg:
             tg.start_soon(serve)
-            await controller.wait_for(S.AVAILABLE)  # registered (also reported when stopping)
+            if reused:  # a later process of the same exporter: it may resume a lease rather than go idle
+                with fail_after(10):
+                    while controller.registered <= registered_before:
+                        await anyio.sleep(0.01)
+            else:
+                await controller.wait_for(S.AVAILABLE)  # registered and idle
             yield h
             tg.cancel_scope.cancel()
     finally:
@@ -310,7 +389,7 @@ async def test_end_session_runs_cleanup_once_while_still_leased(tmp_path):
     async with running(tmp_path, before=hook(log, "before"), after=hook(log, "after")) as h:
         h.controller.assign("lease-a")
         await h.controller.wait_for(S.LEASE_READY)
-        path = h.exporter._lease_context.socket_path
+        path = session_socket(h.exporter)
         async with grpc.aio.secure_channel(
             f"unix://{path}", grpc.local_channel_credentials(grpc.LocalConnectionType.UDS)
         ) as channel:
@@ -362,7 +441,7 @@ async def test_end_session_keeps_the_client_connected_through_cleanup(tmp_path):
         await h.controller.wait_for(S.LEASE_READY)
         h.controller.dial("conn-1")
         await h.wait_opened("conn-1")
-        path = h.exporter._lease_context.socket_path
+        path = session_socket(h.exporter)
         async with grpc.aio.secure_channel(
             f"unix://{path}", grpc.local_channel_credentials(grpc.LocalConnectionType.UDS)
         ) as channel:

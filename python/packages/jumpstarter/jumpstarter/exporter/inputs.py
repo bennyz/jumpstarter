@@ -21,6 +21,12 @@ class Assignment:
     lease_name: str
     client_name: str = ""
     context: tuple[tuple[str, str], ...] = ()
+    lease_uid: str = ""
+    """Tells the lease apart from an earlier one with the same name."""
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.lease_name, self.lease_uid)
 
 
 @dataclass(frozen=True)
@@ -41,6 +47,10 @@ class Inputs:
     stop: StopRequest | None = None
     stop_now_at: float | None = None
     """anyio clock time of the first stop-now request."""
+    status_seen: bool = False
+    """At least one Status message arrived: the assignment and hook record are known."""
+    hook_record: jumpstarter_pb2.LeaseHooks | None = None
+    """The controller's hook record of this exporter's latest lease; None if it keeps none."""
 
     @property
     def stop_now(self) -> bool:
@@ -79,12 +89,16 @@ class InputBuffer:
                 lease_name=status.lease_name,
                 client_name=status.client_name,
                 context=tuple(sorted(status.context.items())),
+                lease_uid=status.lease_uid,
             )
         current = self._inputs
-        before = current.assignment.lease_name if current.assignment else None
-        after = assignment.lease_name if assignment else None
+        before = current.assignment.key if current.assignment else None
+        after = assignment.key if assignment else None
         generation = current.generation + (1 if before != after else 0)
-        self._publish(replace(current, assignment=assignment, generation=generation))
+        record = status.lease_hooks if status.HasField("lease_hooks") else None
+        self._publish(replace(
+            current, assignment=assignment, generation=generation, status_seen=True, hook_record=record,
+        ))
         return self._inputs
 
     def request_stop(self, *, now: bool, unregister: bool) -> StopRequest:

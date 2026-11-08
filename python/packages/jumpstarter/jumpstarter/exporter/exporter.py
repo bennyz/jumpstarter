@@ -1422,8 +1422,8 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         if after is None:
             await self._record_lease_hook(lease, "after_lease", LeaseHookPhase.SKIPPED, "beforeLease hook failed")
         if not assigned:
-            if self._records_lease_hooks:
-                await self._report_status(ExporterStatus.AVAILABLE, "Exporter registered and available")
+            # Reported once the record is checked: it tells the controller no hook work is owed.
+            await self._report_status(ExporterStatus.AVAILABLE, "Exporter registered and available")
             return
         self._lease_context = lease  # routes the release and status below to this lease
         try:
@@ -1436,16 +1436,9 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         finally:
             self._lease_context = None
 
-    def _lease_log_context(self, status: jumpstarter_pb2.StatusResponse | Assignment) -> dict[str, str]:
-        """Log context for a newly-assigned lease."""
-        if isinstance(status, Assignment):
-            log_ctx = {"lease_id": status.lease_name, "exporter": self.exporter_name}
-            log_ctx.update(dict(status.context))
-            return log_ctx
-        log_ctx = {"lease_id": status.lease_name, "exporter": self.exporter_name}
-        if status.context:
-            log_ctx.update(status.context)
-        return log_ctx
+    def _lease_log_context(self, assignment: Assignment) -> dict[str, str]:
+        """Log context for a newly-assigned lease: its name, this exporter, and the lease's spec.context."""
+        return {"lease_id": assignment.lease_name, "exporter": self.exporter_name, **dict(assignment.context)}
 
     async def _serve_lease(self, lease: LeaseContext, entry: "Entry", log_context: dict[str, str]) -> str | None:
         """Serve one lease, from setup to the controller releasing it.

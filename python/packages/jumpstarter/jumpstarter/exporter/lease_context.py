@@ -68,14 +68,6 @@ class LeaseContext:
         if self.notify is not None:
             self.notify()
 
-    def is_ready(self) -> bool:
-        """Check if the lease scope has been fully initialized with session and socket.
-
-        Note: This checks for resource initialization (session/socket), not lease activity.
-        Use is_active() to check if the lease itself is active.
-        """
-        return self.session is not None and self.socket_path != ""
-
     def is_active(self) -> bool:
         """Check if this lease is active (has a non-empty lease name)."""
         return bool(self.lease_name)

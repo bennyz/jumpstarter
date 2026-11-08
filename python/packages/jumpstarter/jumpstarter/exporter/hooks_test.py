@@ -1790,44 +1790,9 @@ class TestBeforeLeaseHookLeaseEndedGuard:
             "no cleanup must be owed when beforeLease hook is skipped (warn)"
         )
 
-    async def test_lease_without_a_session_fails_setup_at_once(self) -> None:
-        """Setup only starts once the lease's session is serving; without one,
-        the check reports BEFORE_LEASE_HOOK_FAILED at once and unblocks
-        downstream instead of waiting."""
-        import anyio
-
-        from jumpstarter.exporter.lease_context import LeaseContext
-
-        lease_scope = LeaseContext(
-            lease_name="test-lease-timeout",
-            before_lease_hook=anyio.Event(),
-            client_name="test-client",
-        )
-
-        executor = HookExecutor(
-            config=HookConfigV1Alpha1(
-                beforeLease=HookInstanceConfigV1Alpha1(script="echo setup", timeout=10),
-            )
-        )
-
-        status_calls = []
-
-        async def mock_report_status(status, msg):
-            status_calls.append((status, msg))
-
-        result = await executor._check_lease_ready(lease_scope, mock_report_status)
-
-        assert result is False
-        assert any(
-            s == ExporterStatus.BEFORE_LEASE_HOOK_FAILED
-            for s, _ in status_calls
-        ), f"Expected BEFORE_LEASE_HOOK_FAILED, got: {status_calls}"
-        assert lease_scope.before_lease_hook.is_set()
-
     async def test_run_before_lease_hook_skips_when_lease_ended_before_session(self) -> None:
-        """When lease_ended is set before the session is created (is_ready()
-        returns False), the hook must bail out immediately without waiting
-        for a session."""
+        """When the lease ended before its session was created, the hook must
+        bail out immediately without waiting for a session."""
         from anyio import Event
 
         from jumpstarter.exporter.lease_context import LeaseContext
@@ -1837,7 +1802,7 @@ class TestBeforeLeaseHookLeaseEndedGuard:
             before_lease_hook=Event(),
             client_name="test-client",
         )
-        # Leave session=None and socket_path="" so is_ready() returns False
+        # Leave session=None and socket_path="": setup never got that far
         lease_scope.lease_ended.set()
 
         hook_config = HookConfigV1Alpha1(
@@ -1859,10 +1824,10 @@ class TestBeforeLeaseHookLeaseEndedGuard:
         )
 
         assert len(status_calls) == 0, (
-            f"No status should be reported when bailing out during is_ready wait, got: {status_calls}"
+            f"No status should be reported when bailing out for an ended lease, got: {status_calls}"
         )
         assert outcome is SetupOutcome.NO_CLEANUP, (
-            "no cleanup must be owed when skipping during is_ready wait"
+            "no cleanup must be owed when skipping an ended lease"
         )
         assert lease_scope.before_lease_hook.is_set(), (
             "before_lease_hook event must be set to unblock downstream waiters"

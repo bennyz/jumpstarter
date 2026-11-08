@@ -52,31 +52,6 @@ class TestLeaseContextInitialization:
 
 
 class TestLeaseContextStateQueries:
-    def test_is_ready_false_without_session(self) -> None:
-        """Test that is_ready() returns False when session is None."""
-        before_hook = Event()
-        ctx = LeaseContext(lease_name="test-lease", before_lease_hook=before_hook)
-        ctx.socket_path = "/tmp/socket"
-
-        assert not ctx.is_ready()
-
-    def test_is_ready_false_without_socket_path(self) -> None:
-        """Test that is_ready() returns False when socket_path is empty."""
-        before_hook = Event()
-        ctx = LeaseContext(lease_name="test-lease", before_lease_hook=before_hook)
-        ctx.session = MagicMock()
-
-        assert not ctx.is_ready()
-
-    def test_is_ready_true_with_both(self) -> None:
-        """Test that is_ready() returns True when both session and socket_path are set."""
-        before_hook = Event()
-        ctx = LeaseContext(lease_name="test-lease", before_lease_hook=before_hook)
-        ctx.session = MagicMock()
-        ctx.socket_path = "/tmp/socket"
-
-        assert ctx.is_ready()
-
     def test_is_active_true_with_lease_name(self) -> None:
         """Test that is_active() returns True when lease_name is non-empty."""
         before_hook = Event()

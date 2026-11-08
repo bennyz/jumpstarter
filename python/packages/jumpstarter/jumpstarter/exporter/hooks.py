@@ -757,29 +757,6 @@ class HookExecutor:
             except Exception:
                 logger.exception("Failed to request lease release")
 
-    async def _check_lease_ready(
-        self,
-        lease_scope: "LeaseContext",
-        report_status: Callable[["ExporterStatus", str], Awaitable[None]],
-    ) -> bool:
-        """Check the lease can run its setup hook.
-
-        The exporter starts setup only once the lease's session is serving, so
-        a missing session is a bug, reported as a setup failure rather than
-        waited for. Returns False if the caller should bail out.
-        """
-        if lease_scope.lease_ended.is_set():
-            # The caller settles a setup that never started (see _setup_did_not_start).
-            logger.info("Lease %s already ended, skipping beforeLease hook", lease_scope.lease_name)
-            return False
-        if not lease_scope.is_ready():
-            error_msg = "Lease session is not ready for the beforeLease hook"
-            logger.error(error_msg)
-            await report_status(ExporterStatus.BEFORE_LEASE_HOOK_FAILED, error_msg)
-            lease_scope.before_lease_hook.set()
-            return False
-        return True
-
     async def run_before_lease_hook(  # noqa: C901
         self,
         lease_scope: "LeaseContext",
@@ -810,9 +787,11 @@ class HookExecutor:
         should_release = False
         outcome = SetupOutcome.CLEAN_UP
         try:
-            if not await self._check_lease_ready(lease_scope, report_status):
-                if lease_scope.lease_ended.is_set():
-                    outcome = await self._setup_did_not_start(lease_scope, record)
+            # The lease can end before setup starts, e.g. a stale lease from a backlog
+            # when the exporter couldn't keep up with lease churn.
+            if lease_scope.lease_ended.is_set():
+                logger.info("Lease %s already ended, skipping beforeLease hook", lease_scope.lease_name)
+                outcome = await self._setup_did_not_start(lease_scope, record)
                 return outcome
 
             # Check if hook is configured
@@ -823,16 +802,6 @@ class HookExecutor:
                     outcome = SetupOutcome.NO_CLEANUP
                     return outcome
                 await report_status(ExporterStatus.LEASE_READY, "Ready for commands")
-                return outcome
-
-            # Skip hook if lease already ended (e.g. stale lease from backlog
-            # when the exporter couldn't keep up with lease churn)
-            if lease_scope.lease_ended.is_set():
-                logger.info(
-                    "Lease %s already ended, skipping beforeLease hook",
-                    lease_scope.lease_name,
-                )
-                outcome = await self._setup_did_not_start(lease_scope, record)
                 return outcome
 
             if not await self._record_start("before_lease", lease_scope, record):
@@ -962,14 +931,6 @@ class HookExecutor:
         should_release = False
         unknown_state = None
         try:
-            # Verify lease scope is ready - for after-lease this should always be true
-            # since we've already processed the lease, but check defensively
-            if not lease_scope.is_ready():
-                logger.warning("LeaseScope not ready for after-lease hook, skipping")
-                await record("after_lease", LeaseHookPhase.SKIPPED, "lease session was not ready")
-                await report_status(ExporterStatus.AVAILABLE, "Available for new lease")
-                return
-
             # Check if hook is configured
             if not self.config.after_lease:
                 logger.debug("No after-lease hook configured")

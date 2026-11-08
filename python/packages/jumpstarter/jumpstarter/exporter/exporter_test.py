@@ -784,105 +784,21 @@ class TestShutdownRuntimeSidecar:
 
 
 class TestContextPropagation:
-    """Tests for spec.context propagation from StatusResponse to log context."""
+    """spec.context of the assigned lease is bound to the lease's log context."""
 
-    async def test_context_bound_on_new_lease(self):
-        """When a new lease is assigned with context, it should be bound to log context."""
+    def test_lease_context_is_bound_with_the_lease(self):
         from jumpstarter.exporter.exporter import Exporter
-        from jumpstarter.logging import clear_log_context
-
-        clear_log_context()
+        from jumpstarter.exporter.inputs import Assignment
 
         exporter = Exporter.__new__(Exporter)
-        exporter._exporter_status = ExporterStatus.AVAILABLE
-        exporter._lease_context = None
-        exporter._standalone = False
-        exporter.hook_executor = None
-        exporter.labels = {}
         exporter.exporter_name = "lab-exporter-01"
-        exporter._report_status = AsyncMock()
-        exporter._request_lease_release = AsyncMock()
-
-        # Simulate receiving a StatusResponse with context
-        status = MagicMock()
-        status.leased = True
-        status.lease_name = "test-lease-ctx"
-        status.client_name = "ci-bot"
-        status.context = {"build_id": "nightly-42", "image_digest": "sha256:abc"}
-
-        from jumpstarter.logging import set_log_context as _orig_set
-
-        calls = []
-
-        def tracking_set(**kwargs):
-            calls.append(kwargs)
-            _orig_set(**kwargs)
-
-        with patch("jumpstarter.exporter.exporter.set_log_context", side_effect=tracking_set):
-            # Simulate the lease assignment block from serve()
-            exporter._lease_context = None
-            if exporter._lease_context is None and status.lease_name != "" and status.leased:
-                lease_scope = LeaseContext(
-                    lease_name=status.lease_name,
-                    before_lease_hook=Event(),
-                )
-                exporter._lease_context = lease_scope
-                tracking_set(**exporter._lease_log_context(status))
-
-        assert len(calls) >= 1
-        first_call = calls[0]
-        assert first_call["lease_id"] == "test-lease-ctx"
-        assert first_call["exporter"] == "lab-exporter-01"
-        assert first_call["build_id"] == "nightly-42"
-        assert first_call["image_digest"] == "sha256:abc"
-
-        clear_log_context()
-
-    async def test_context_not_bound_when_empty(self):
-        """When StatusResponse has no context, only lease_id and exporter are bound."""
-        from jumpstarter.logging import clear_log_context
-
-        clear_log_context()
-
-        status = MagicMock()
-        status.leased = True
-        status.lease_name = "lease-no-ctx"
-        status.client_name = ""
-        status.context = {}
-
-        calls = []
-
-        from jumpstarter.logging import set_log_context as _orig_set
-
-        def tracking_set(**kwargs):
-            calls.append(kwargs)
-            _orig_set(**kwargs)
-
-        # Simulate the lease assignment block
-        log_ctx = {"lease_id": status.lease_name, "exporter": "my-exporter"}
-        if status.context:
-            log_ctx.update(status.context)
-        tracking_set(**log_ctx)
-
-        assert len(calls) == 1
-        assert calls[0] == {"lease_id": "lease-no-ctx", "exporter": "my-exporter"}
-        assert "build_id" not in calls[0]
-
-        clear_log_context()
-
-    async def test_client_name_bound_separately(self):
-        """Client name is bound in a separate set_log_context call."""
-        from jumpstarter.logging import clear_log_context
-
-        clear_log_context()
-
-        calls = []
-
-        def tracking_set(**kwargs):
-            calls.append(kwargs)
-
-        # Simulate the client name binding (line 828 in exporter.py)
-        tracking_set(client="ci-bot")
-
-        assert calls == [{"client": "ci-bot"}]
-        clear_log_context()
+        with_context = Assignment(
+            lease_name="lease-ctx", context=(("build_id", "nightly-42"), ("image_digest", "sha256:abc")),
+        )
+        assert exporter._lease_log_context(with_context) == {
+            "lease_id": "lease-ctx", "exporter": "lab-exporter-01",
+            "build_id": "nightly-42", "image_digest": "sha256:abc",
+        }
+        assert exporter._lease_log_context(Assignment(lease_name="lease-no-ctx")) == {
+            "lease_id": "lease-no-ctx", "exporter": "lab-exporter-01",
+        }

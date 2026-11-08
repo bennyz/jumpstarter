@@ -21,6 +21,14 @@ from jumpstarter.exporter.hooks import (
 
 pytestmark = pytest.mark.anyio
 
+
+async def _no_release(lease_scope) -> None:
+    pass
+
+
+async def _record_nothing(hook, phase, message="", on_failure="", attempts=None) -> bool:
+    return True
+
 # Tests that spawn real subprocesses via PTY and assert on captured logger
 # output are flaky on macOS due to a PTY kernel buffer timing race condition.
 # See https://github.com/jumpstarter-dev/jumpstarter/issues/821
@@ -612,7 +620,7 @@ class TestHookExecutor:
         outcome = await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
-            mock_shutdown,
+            mock_shutdown, _no_release, record_hook=_record_nothing,
         )
 
         assert outcome is SetupOutcome.NO_CLEANUP
@@ -633,7 +641,7 @@ class TestHookExecutor:
             lease_scope,
             mock_report_status,
             mock_shutdown,
-            mock_request_lease_release,
+            mock_request_lease_release, record_hook=_record_nothing,
         )
 
         assert outcome is SetupOutcome.NO_CLEANUP
@@ -659,7 +667,7 @@ class TestHookExecutor:
             lease_scope,
             mock_report_status,
             mock_shutdown,
-            mock_request_lease_release,
+            mock_request_lease_release, record_hook=_record_nothing,
         )
 
         assert outcome is SetupOutcome.NO_CLEANUP
@@ -1249,9 +1257,13 @@ class TestHookExecutorPRRegressions:
         ):
             if outcome == "cancelled":
                 with pytest.raises(anyio.get_cancelled_exc_class()):
-                    await executor.run_after_lease_hook(lease_scope, AsyncMock(), shutdown, release)
+                    await executor.run_after_lease_hook(
+                        lease_scope, AsyncMock(), shutdown, release, record_hook=_record_nothing
+                    )
             else:
-                await executor.run_after_lease_hook(lease_scope, AsyncMock(), shutdown, release)
+                await executor.run_after_lease_hook(
+                    lease_scope, AsyncMock(), shutdown, release, record_hook=_record_nothing
+                )
         if outcome == "failure" and on_failure == "endLease":
             sleep.assert_awaited_once_with(1.0)
             release.assert_awaited_once_with(lease_scope)
@@ -1319,7 +1331,7 @@ class TestHookExecutorPRRegressions:
         await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
-            mock_shutdown,
+            mock_shutdown, _no_release, record_hook=_record_nothing,
         )
 
         # Event must always be set to unblock connections
@@ -1342,7 +1354,7 @@ class TestHookExecutorPRRegressions:
         outcome = await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
-            mock_shutdown,
+            mock_shutdown, _no_release, record_hook=_record_nothing,
         )
 
         assert lease_scope.before_lease_hook.is_set()
@@ -1369,7 +1381,7 @@ class TestHookExecutorPRRegressions:
         await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
-            mock_shutdown,
+            mock_shutdown, _no_release, record_hook=_record_nothing,
         )
 
         # Should have reported LEASE_READY
@@ -1403,7 +1415,7 @@ class TestHookExecutorPRRegressions:
         outcome = await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
-            mock_shutdown,
+            mock_shutdown, _no_release, record_hook=_record_nothing,
         )
 
         assert outcome is SetupOutcome.NO_CLEANUP
@@ -1414,7 +1426,7 @@ class TestHookExecutorPRRegressions:
             await executor.run_after_lease_hook(
                 lease_scope,
                 mock_report_status,
-                mock_shutdown,
+                mock_shutdown, _no_release, record_hook=_record_nothing,
             )
 
         # AFTER_LEASE_HOOK status should never have been reported
@@ -1445,7 +1457,7 @@ class TestHookExecutorPRRegressions:
         await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
-            mock_shutdown,
+            mock_shutdown, _no_release, record_hook=_record_nothing,
         )
 
         # Last status should be OFFLINE (reported before shutdown to prevent new leases)
@@ -1494,7 +1506,7 @@ class TestHookExecutorPRRegressions:
             lease_scope,
             mock_report_status,
             mock_shutdown,
-            mock_request_release,
+            mock_request_release, record_hook=_record_nothing,
         )
 
         # AFTER_LEASE_HOOK_FAILED should be in statuses
@@ -1534,7 +1546,7 @@ class TestHookExecutorPRRegressions:
         await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
-            mock_shutdown,
+            mock_shutdown, _no_release, record_hook=_record_nothing,
         )
 
         # Find the LEASE_READY status call
@@ -1569,7 +1581,7 @@ class TestHookExecutorPRRegressions:
         await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
-            mock_shutdown,
+            mock_shutdown, _no_release, record_hook=_record_nothing,
         )
 
         offline_indices = [
@@ -1608,7 +1620,7 @@ class TestHookExecutorPRRegressions:
             lease_scope,
             mock_report_status,
             mock_shutdown,
-            mock_request_release,
+            mock_request_release, record_hook=_record_nothing,
         )
 
         offline_indices = [
@@ -1647,7 +1659,7 @@ class TestHookExecutorPRRegressions:
         await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
-            mock_shutdown,
+            mock_shutdown, _no_release, record_hook=_record_nothing,
         )
 
         # beforeLease with warn should still transition to LEASE_READY
@@ -1659,7 +1671,7 @@ class TestHookExecutorPRRegressions:
             lease_scope,
             mock_report_status,
             mock_shutdown,
-            mock_request_release,
+            mock_request_release, record_hook=_record_nothing,
         )
 
         # afterLease hook should run and transition to AVAILABLE
@@ -1689,7 +1701,7 @@ class TestHookExecutorPRRegressions:
         await executor.run_after_lease_hook(
             lease_scope,
             mock_report_status,
-            mock_shutdown,
+            mock_shutdown, _no_release, record_hook=_record_nothing,
         )
 
         # Find the AVAILABLE status call
@@ -1727,7 +1739,7 @@ class TestBeforeLeaseHookLeaseEndedGuard:
         outcome = await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
-            mock_shutdown,
+            mock_shutdown, _no_release, record_hook=_record_nothing,
         )
 
         assert len(status_calls) == 0, (
@@ -1753,7 +1765,7 @@ class TestBeforeLeaseHookLeaseEndedGuard:
         await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
-            mock_shutdown,
+            mock_shutdown, _no_release, record_hook=_record_nothing,
         )
 
         assert lease_scope.before_lease_hook.is_set(), (
@@ -1780,7 +1792,7 @@ class TestBeforeLeaseHookLeaseEndedGuard:
         outcome = await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
-            mock_shutdown,
+            mock_shutdown, _no_release, record_hook=_record_nothing,
         )
 
         assert len(status_calls) == 0, (
@@ -1820,7 +1832,7 @@ class TestBeforeLeaseHookLeaseEndedGuard:
         outcome = await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
-            mock_shutdown,
+            mock_shutdown, _no_release, record_hook=_record_nothing,
         )
 
         assert len(status_calls) == 0, (

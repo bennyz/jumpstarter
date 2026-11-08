@@ -58,12 +58,6 @@ async def close_setup_record(lease_scope: "LeaseContext", record: RecordHook, me
         await record("before_lease", LeaseHookPhase.FAILED, message, attempts=previous)
 
 
-async def _record_nothing(
-    hook: HookType, phase: LeaseHookPhase, message: str = "", on_failure: str = "", attempts: int | None = None
-) -> bool:
-    return True
-
-
 MAX_DRAIN_BYTES = 256 * 1024
 DRAIN_TIMEOUT_SECONDS = 2.0
 DRAIN_MAX_EMPTY_POLLS = 10
@@ -743,27 +737,26 @@ class HookExecutor:
 
     async def _safe_release_lease(
         self,
-        request_lease_release: Callable[["LeaseContext"], Awaitable[None]] | None,
+        request_lease_release: Callable[["LeaseContext"], Awaitable[None]],
         lease_scope: "LeaseContext",
     ) -> None:
-        """Call request_lease_release if provided, logging any errors.
+        """Call request_lease_release, logging any errors.
 
         lease_scope identifies the lease whose hook failed, so the exporter
         can reject the release if that lease was replaced in the meantime.
         """
-        if request_lease_release:
-            try:
-                await request_lease_release(lease_scope)
-            except Exception:
-                logger.exception("Failed to request lease release")
+        try:
+            await request_lease_release(lease_scope)
+        except Exception:
+            logger.exception("Failed to request lease release")
 
     async def run_before_lease_hook(  # noqa: C901
         self,
         lease_scope: "LeaseContext",
         report_status: Callable[["ExporterStatus", str], Awaitable[None]],
         shutdown: Callable[..., None],
-        request_lease_release: Callable[["LeaseContext"], Awaitable[None]] | None = None,
-        record_hook: RecordHook | None = None,
+        request_lease_release: Callable[["LeaseContext"], Awaitable[None]],
+        record_hook: RecordHook,
     ) -> SetupOutcome:
         """Execute before-lease hook with full orchestration.
 
@@ -783,7 +776,7 @@ class HookExecutor:
             record_hook: Async callback recording hook transitions with the controller;
                 the hook starts only once its start is recorded
         """
-        record = record_hook or _record_nothing
+        record = record_hook
         should_release = False
         outcome = SetupOutcome.CLEAN_UP
         try:
@@ -901,8 +894,8 @@ class HookExecutor:
         lease_scope: "LeaseContext",
         report_status: Callable[["ExporterStatus", str], Awaitable[None]],
         shutdown: Callable[..., None],
-        request_lease_release: Callable[["LeaseContext"], Awaitable[None]] | None = None,
-        record_hook: RecordHook | None = None,
+        request_lease_release: Callable[["LeaseContext"], Awaitable[None]],
+        record_hook: RecordHook,
     ) -> str | None:
         """Execute after-lease hook with full orchestration.
 
@@ -927,7 +920,7 @@ class HookExecutor:
             Why the device state is unknown, when the hook failed unexpectedly
             (outside its onFailure policy); None otherwise.
         """
-        record = record_hook or _record_nothing
+        record = record_hook
         should_release = False
         unknown_state = None
         try:

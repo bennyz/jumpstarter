@@ -95,9 +95,10 @@ async def test_setup_cut_off_by_a_stop_is_finished_per_on_interrupt(tmp_path, on
             assert "did not finish" in ctl.reports[-1][2]
         else:
             await ctl.wait_for(S.BEFORE_LEASE_HOOK_FAILED)
-            with fail_after(10):
-                while ctl.releases != ["lease-a"]:
+            with fail_after(10):  # the controller ends it once the failure is recorded
+                while ctl.assigned is not None:
                     await anyio.sleep(0.01)
+            assert ctl.releases == []
         assert second.hook_runs() == ["before lease-a"]  # not run again
         assert ctl.hook_phase("before_lease") == Phase.FAILED
 

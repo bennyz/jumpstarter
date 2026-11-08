@@ -69,7 +69,7 @@ logger = logging.getLogger(__name__)
 # gRPC retry configuration
 # Worst case ~18 min (21 attempts × 30s timeout + backoff sum ~8 min).
 # The exporter has nothing useful to do while the controller is unreachable —
-# even a restart just fails at _register_with_controller (no retry).
+# a restart would only wait in _register_with_controller.
 _TRANSIENT_GRPC_CODES = frozenset({grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED})
 _RPC_MAX_RETRIES = 20
 _RPC_BACKOFF_BASE = 1.0
@@ -119,6 +119,18 @@ def _hook_failure_ended_lease(state: jumpstarter_pb2.LeaseHookState | None) -> b
         and state.phase == LeaseHookPhase.FAILED
         and failure_ends_lease(_HOOK_FAILURE_ACTION_NAMES.get(state.on_failure, ""))
     )
+
+
+def _note_recorded(
+    lease: LeaseContext, hook: HookType, phase: LeaseHookPhase, on_failure: str, attempts: int
+) -> None:
+    """What a written hook transition tells this process about the lease."""
+    if hook == "before_lease":
+        lease.hooks.recorded = True
+    if phase == LeaseHookPhase.RUNNING:
+        lease.hooks.started[hook] = attempts
+    if phase == LeaseHookPhase.FAILED and failure_ends_lease(on_failure):
+        lease.hooks.controller_ends_lease = True
 
 
 class Entry(Enum):
@@ -460,10 +472,12 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         The record outlives this process: the next one resumes the lease from it.
         Hooks start only once their start is recorded, and every transition is
         recorded before the lease moves on, retrying while the controller is
-        unreachable. The exception is a setup whose lease ended before it
-        started: it must not start. Returns False if the transition was not
-        recorded; a hook whose start returns False must not run. A controller
-        without the call keeps no record, and the lease's hooks run without one.
+        unreachable. The exceptions are a setup whose lease ended before it
+        started, which must not start, and a stop: the write gets the stop grace,
+        like a hook, and the next process reads what it did not record. Returns
+        False if the transition was not recorded; a hook whose start returns
+        False must not run. A controller without the call keeps no record, and
+        the lease's hooks run without one.
         """
         if not lease.hooks.tracked:
             return True
@@ -485,35 +499,36 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         )
         setup_start = hook == "before_lease" and phase in (LeaseHookPhase.RUNNING, LeaseHookPhase.SKIPPED)
         description = f"record {HOOK_NAMES[hook]} hook {phase}"
-        while True:
-            if setup_start and lease.lease_ended.is_set():
-                logger.info("Not recording %s: lease %s ended before its setup started", description, lease.lease_name)
-                return False
-            ok, code = await self._retry_rpc(
-                lambda ctrl: ctrl.UpdateLeaseHooks(request, timeout=_RPC_TIMEOUT),
-                description,
-                non_retryable_codes=_LEASE_HOOK_REFUSED_CODES | {grpc.StatusCode.UNIMPLEMENTED},
-            )
-            if ok:
-                if hook == "before_lease":
-                    lease.hooks.recorded = True
-                if phase == LeaseHookPhase.RUNNING:
-                    lease.hooks.started[hook] = attempts
-                return True
-            if code == grpc.StatusCode.UNIMPLEMENTED:
-                logger.warning(
-                    "Controller does not record lease hooks; the hooks of lease %s run without a record",
-                    lease.lease_name,
+        async with self._stoppable(f"Recording {HOOK_NAMES[hook]} hook {phase}"):
+            while True:
+                if setup_start and lease.lease_ended.is_set():
+                    logger.info(
+                        "Not recording %s: lease %s ended before its setup started", description, lease.lease_name
+                    )
+                    return False
+                ok, code = await self._retry_rpc(
+                    lambda ctrl: ctrl.UpdateLeaseHooks(request, timeout=_RPC_TIMEOUT),
+                    description,
+                    non_retryable_codes=_LEASE_HOOK_REFUSED_CODES | {grpc.StatusCode.UNIMPLEMENTED},
                 )
-                lease.hooks.tracked = False
-                return True
-            if code in _LEASE_HOOK_REFUSED_CODES:
-                logger.warning("Controller refused to %s for lease %s", description, lease.lease_name)
-                return False
-            # Retries ran out with the controller still unreachable: the record must
-            # not be skipped, so keep going. A stop's grace or a forced stop ends this.
-            logger.warning("Still unable to %s for lease %s; retrying", description, lease.lease_name)
-            await sleep(_RPC_BACKOFF_CAP)
+                if ok:
+                    _note_recorded(lease, hook, phase, on_failure, attempts)
+                    return True
+                if code == grpc.StatusCode.UNIMPLEMENTED:
+                    logger.warning(
+                        "Controller does not record lease hooks; the hooks of lease %s run without a record",
+                        lease.lease_name,
+                    )
+                    lease.hooks.tracked = False
+                    return True
+                if code in _LEASE_HOOK_REFUSED_CODES:
+                    logger.warning("Controller refused to %s for lease %s", description, lease.lease_name)
+                    return False
+                # Retries ran out with the controller still unreachable: the record must
+                # not be skipped, so keep going until it is written or a stop's grace ends.
+                logger.warning("Still unable to %s for lease %s; retrying", description, lease.lease_name)
+                await sleep(_RPC_BACKOFF_CAP)
+        return False  # a stop's grace ran out before the controller came back
 
     def stop(self, wait_for_lease_exit=False, should_unregister=False, exit_code: int | None = None):
         """Ask the exporter to stop.
@@ -571,15 +586,21 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         send_tx,
         backoff: float = 0.5,
         outage_budget: float | None = None,
+        on_reconnect: Callable[[], None] = lambda: None,
     ):
-        """Reconnect a controller stream until data resumes or its outage budget expires."""
+        """Reconnect a controller stream until data resumes.
+
+        The outage budget applies only while no lease is served: client sessions
+        go through the router and survive a controller outage, and a restarted
+        exporter could do nothing without the controller anyway. Losing the
+        controller (the budget running out, or a fatal error) stops the exporter
+        like a stop-now does, so a running hook gets its stop grace.
+        """
         delay = backoff
         outage_started = None
+        kept_lease = None
         while True:
-            deadline = math.inf
-            if outage_started is not None and outage_budget is not None:
-                deadline = outage_started + outage_budget
-            scope = CancelScope(deadline=deadline)
+            scope = CancelScope(deadline=self._outage_deadline(outage_started, outage_budget))
             try:
                 with scope:
                     async with self._controller_stub() as controller:
@@ -591,19 +612,19 @@ class Exporter(AsyncContextManagerMixin, Metadata):
                                     anyio.current_time() - outage_started,
                                 )
                                 outage_started = None
+                                kept_lease = None
                                 scope.deadline = math.inf
+                                on_reconnect()
                             delay = backoff
                             await send_tx.send(item)
             except Exception as e:
                 if not _is_retryable_stream_error(e):
                     if isinstance(e, grpc.aio.AioRpcError):
-                        self._controller_stream_failed = True
                         # A new process reloads rotated credentials; PermissionDenied
                         # can also mean the controller temporarily lost API access.
-                        self._exit_code = (
-                            _TEMPORARY_STREAM_FAILURE_EXIT_CODE
-                            if e.code() in _RESTARTABLE_STREAM_CODES else 1
-                        )
+                        exit_code = _TEMPORARY_STREAM_FAILURE_EXIT_CODE if e.code() in _RESTARTABLE_STREAM_CODES else 1
+                        self._lose_controller(exit_code, f"{stream_name} stream failed: {e.code().name}: {e.details()}")
+                        return
                     raise
                 reason = str(e)
             else:
@@ -616,23 +637,66 @@ class Exporter(AsyncContextManagerMixin, Metadata):
             else:
                 logger.debug("%s stream still unavailable: %s", stream_name, reason)
 
-            wait = min(delay, self._remaining_stream_budget(stream_name, now - outage_started, outage_budget))
+            wait, kept_lease = self._outage_wait(stream_name, delay, now - outage_started, outage_budget, kept_lease)
+            if wait is None:
+                return
             # Keep the lease session alive until Status confirms release. EOF
             # needs the same backoff as an error to avoid a busy reconnect loop.
             await sleep(wait)
             delay = min(delay * 2, 5.0)
 
-    def _remaining_stream_budget(self, stream_name: str, elapsed: float, budget: float | None) -> float:
-        if budget is None:
+    def _outage_deadline(self, outage_started: float | None, budget: float | None) -> float:
+        """When a reconnect attempt gives up: the outage budget counts only while no lease is served."""
+        if outage_started is None or budget is None or self._lease_context is not None:
             return math.inf
-        remaining = budget - elapsed
-        if remaining <= 0:
-            self._controller_stream_failed = True
-            self._exit_code = _TEMPORARY_STREAM_FAILURE_EXIT_CODE
-            message = f"{stream_name} stream unavailable for {elapsed:.1f}s (budget {budget:.1f}s)"
-            logger.error(message)
-            raise TimeoutError(message)
-        return remaining
+        return outage_started + budget
+
+    def _outage_wait(
+        self, stream_name: str, delay: float, elapsed: float, budget: float | None, logged_for: LeaseContext | None
+    ) -> tuple[float | None, LeaseContext | None]:
+        """How long to wait before reconnecting; None once the controller is given up on.
+
+        Past the budget, a served lease keeps running (logged once per lease, the
+        lease returned for that); with no lease, the controller is lost.
+        """
+        if budget is None:
+            return delay, logged_for
+        if elapsed < budget:
+            return min(delay, budget - elapsed), logged_for
+        lease = self._lease_context
+        if lease is None:
+            self._lose_controller(
+                _TEMPORARY_STREAM_FAILURE_EXIT_CODE,
+                f"{stream_name} stream unavailable for {elapsed:.1f}s (budget {budget:.1f}s)",
+            )
+            return None, None
+        if lease is not logged_for:
+            logger.warning(
+                "%s stream unavailable for %.1fs; keeping lease %s running until the controller is back",
+                stream_name, elapsed, lease.lease_name,
+            )
+        return delay, lease
+
+    def _lose_controller(self, exit_code: int, reason: str) -> None:
+        """Give up on the controller: stop now, as a stop request does.
+
+        Waiting phases end at once and a running hook gets the stop grace. A
+        lease whose hooks are recorded is left to the next process.
+        """
+        logger.error("%s; stopping", reason)
+        self._controller_stream_failed = True
+        self._exit_code = exit_code
+        if not self._inputs.snapshot().stop_now:  # a repeated stop-now would skip the grace
+            self._inputs.request_stop(now=True, unregister=False)
+
+    def _resend_status(self) -> None:
+        """Send the latest status again once the Status stream is back.
+
+        A report can be dropped during an outage, and the controller clears an
+        Offline status when the stream reconnects.
+        """
+        if self._status_drain_active and self._pending_status_request is not None:
+            self._status_rpc_event.set()
 
     def _listen_stream_factory(
         self, lease_name: str
@@ -661,24 +725,45 @@ class Exporter(AsyncContextManagerMixin, Metadata):
     async def _register_with_controller(self, local_channel: grpc.aio.Channel):
         """Register the exporter with the controller.
 
+        Waits for an unreachable controller, as the streams do: a process that
+        gave up would only be restarted into the same wait. A stop ends the
+        wait, with nothing registered and so nothing to unregister.
+
         Args:
             local_channel: The local Unix socket channel to get device reports from
         """
         # Get device reports from the local session
         exporter_stub = jumpstarter_pb2_grpc.ExporterServiceStub(local_channel)
         response: jumpstarter_pb2.GetReportResponse = await exporter_stub.GetReport(empty_pb2.Empty())
+        request = jumpstarter_pb2.RegisterRequest(
+            labels=self.labels,
+            reports=response.reports,
+            # Lets the controller hold this exporter while its record owes cleanup.
+            records_lease_hooks=self._records_lease_hooks,
+        )
 
         # Register with the REMOTE controller (not the local session)
         logger.info("Registering exporter with controller")
-        async with self._controller_stub() as controller:
-            await controller.Register(
-                jumpstarter_pb2.RegisterRequest(
-                    labels=self.labels,
-                    reports=response.reports,
-                    # Lets the controller hold this exporter while its record owes cleanup.
-                    records_lease_hooks=self._records_lease_hooks,
-                )
-            )
+        attempt = 0
+        while True:
+            try:
+                async with self._controller_stub() as controller:
+                    await controller.Register(request)
+                break
+            except grpc.aio.AioRpcError as e:
+                if e.code() not in _TRANSIENT_GRPC_CODES:
+                    raise
+                error = f"{e.code().name}: {e.details()}"
+            except (CertificateDiscoveryError, OSError) as e:
+                error = str(e)
+            backoff = _rpc_backoff(attempt)
+            attempt += 1
+            logger.warning("Controller unreachable (%s); registering again in %.1fs", error, backoff)
+            with move_on_after(backoff):
+                await self._inputs.wait_until(lambda i: i.stop is not None)
+            if self._inputs.snapshot().stop is not None:
+                logger.info("Stopping before the exporter registered")
+                return
         # Mark exporter as registered internally
         self._registered = True
         # Only report AVAILABLE status during initial registration (no lease context)
@@ -984,8 +1069,13 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         cannot release, or report AVAILABLE over, a replacement lease.
 
         Uses the named ReleaseLease RPC, supported for exporters since controller
-        v0.9.0, so retries cannot target a replacement lease.
+        v0.9.0, so retries cannot target a replacement lease. A controller that
+        recorded the failure ends the lease itself; the lease then ends through
+        the Status stream like any other.
         """
+        if lease_scope.hooks.controller_ends_lease:
+            logger.info("The controller ends lease %s after its endLease hook failure", lease_scope.lease_name)
+            return
         if self._controller_stream_failed:
             logger.info("Skipping lease-release RPC after controller stream failure")
             return
@@ -1181,6 +1271,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
                     _StatusSink(self),
                     backoff=0.5,
                     outage_budget=self.status_stream_retry_timeout,
+                    on_reconnect=self._resend_status,
                 ))
                 tg.start_soon(self._token_refresh_loop)
                 await self._lifecycle()
@@ -1217,8 +1308,10 @@ class Exporter(AsyncContextManagerMixin, Metadata):
 
     async def _lifecycle(self) -> None:
         inputs = await self._inputs.wait_until(lambda i: i.status_seen or i.stop is not None)
-        admitted = None if inputs.stop is not None else await self._take_over_from_previous_process(inputs)
-        while True:
+        admitted, parked = None, None
+        if inputs.stop is None:
+            admitted, parked = await self._take_over_from_previous_process(inputs)
+        while parked is None:
             inputs = await self._inputs.wait_until(
                 lambda i, admitted=admitted: i.stop is not None
                 or (i.assignment is not None and i.generation != admitted)
@@ -1236,19 +1329,22 @@ class Exporter(AsyncContextManagerMixin, Metadata):
                 # Hook records identify a lease by its UID, which every controller that keeps them sends.
                 hooks=HookPlan(tracked=self._tracks_lease_hooks and bool(a.lease_uid)),
             )
-            await self._serve_lease(lease, Entry.NEW, self._lease_log_context(a))
+            parked = await self._serve_lease(lease, Entry.NEW, self._lease_log_context(a))
+        if parked is not None:
+            await self._park(parked)
         self._phase.move(Phase.STOPPING)
         stop = self._inputs.snapshot().stop
         self._unregister = stop.unregister if stop is not None else False
 
-    async def _take_over_from_previous_process(self, inputs: Inputs) -> int | None:
+    async def _take_over_from_previous_process(self, inputs: Inputs) -> tuple[int | None, str | None]:
         """Pick up what a previous exporter process left of its last lease, before anything else.
 
         The controller's hook record names that lease, and decide_restart says
         what it still needs. A lease that needs hooks goes through _serve_lease
         like any other, with an Entry that skips the steps that already ran.
         Returns the assignment generation this handled, so the loop does not
-        admit that lease again; None if the assigned lease (if any) is new.
+        admit that lease again (None if the assigned lease, if any, is new),
+        and why to park, as _serve_lease does.
         """
         record = inputs.hook_record
         a = inputs.assignment
@@ -1263,7 +1359,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
             if self._records_lease_hooks and a is None:
                 # Reported once the record is checked: it tells the controller no hook work is owed.
                 await self._report_status(ExporterStatus.AVAILABLE, "Exporter registered and available")
-            return None
+            return None, None
         assert record is not None
         before = record.before_lease
         after = record.after_lease if record.HasField("after_lease") else None
@@ -1277,7 +1373,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         handled = inputs.generation if assigned is not None else None
         if restart is Restart.SETTLE:
             await self._settle_lease_without_hooks(lease, before, after, assigned is not None)
-            return handled
+            return handled, None
         if restart is Restart.FINISH_SETUP:
             logger.info("Resuming lease %s after exporter restart (beforeLease hook did not finish)", lease.lease_name)
             lease.hooks.finish_cut_off("before_lease", before, self._on_interrupt("before_lease"), lease.lease_name)
@@ -1306,8 +1402,8 @@ class Exporter(AsyncContextManagerMixin, Metadata):
             else:
                 logger.info("Lease %s owes its afterLease hook; running it", lease.lease_name)
             entry = Entry.CLEAN_UP
-        await self._serve_lease(lease, entry, {"lease_id": lease.lease_name, "exporter": self.exporter_name})
-        return handled
+        parked = await self._serve_lease(lease, entry, {"lease_id": lease.lease_name, "exporter": self.exporter_name})
+        return handled, parked
 
     async def _settle_lease_without_hooks(
         self,
@@ -1351,7 +1447,12 @@ class Exporter(AsyncContextManagerMixin, Metadata):
             log_ctx.update(status.context)
         return log_ctx
 
-    async def _serve_lease(self, lease: LeaseContext, entry: "Entry", log_context: dict[str, str]) -> None:
+    async def _serve_lease(self, lease: LeaseContext, entry: "Entry", log_context: dict[str, str]) -> str | None:
+        """Serve one lease, from setup to the controller releasing it.
+
+        Returns why to park: the afterLease hook failed unexpectedly, so the
+        device state is unknown. None once the device is ready for the next lease.
+        """
         self._lease_context = lease
         set_log_context(**log_context)
         if lease.client_name:
@@ -1384,6 +1485,32 @@ class Exporter(AsyncContextManagerMixin, Metadata):
             clear_log_context()
             set_log_context(exporter=self.exporter_name)
             self._phase.move(Phase.IDLE)
+        if lease.cleanup_failure is not None:
+            return lease.cleanup_failure
+        # Ready for the next lease. This also clears a failure status a lease
+        # ended with (an endLease failure the controller ended it for); a stopping
+        # exporter does not report it (_report_status).
+        if self._exporter_status != ExporterStatus.AVAILABLE:
+            await self._report_status(ExporterStatus.AVAILABLE, "Available for new lease")
+        return None
+
+    async def _park(self, reason: str) -> None:
+        """Admit no lease until restarted: the afterLease hook failed unexpectedly.
+
+        The device state is unknown, so the next lease could start on a board in
+        any state. The failure status stays, which keeps the controller from
+        assigning this exporter. A restart (after checking the device) clears it.
+        """
+        self._phase.move(Phase.PARKED)
+        logger.error(
+            "Not admitting leases: the afterLease hook failed unexpectedly (%s). "
+            "Check the device, then restart the exporter.", reason,
+        )
+        await self._report_status(
+            ExporterStatus.AFTER_LEASE_HOOK_FAILED,
+            f"afterLease hook failed: {reason}; not admitting leases until the exporter restarts",
+        )
+        await self._inputs.wait_until(lambda i: i.stop is not None)
 
     async def _lease_activity(self, lease: LeaseContext, entry: "Entry", *, connections: bool) -> None:
         if lease.lease_ended.is_set() and entry is Entry.NEW:
@@ -1400,16 +1527,18 @@ class Exporter(AsyncContextManagerMixin, Metadata):
             else:
                 await self._run_setup(lease)
             if lease.skip_after_lease_hook:
-                # Setup failed with endLease/exit: no cleanup, keep the session
-                # (and the failure status) until the lease is released.
-                self._phase.move(Phase.HOLDING)
+                # Setup failed with endLease/exit: no cleanup. Close the record's
+                # cleanup, or the controller holds this exporter for it, and keep
+                # the session (and the failure status) until the lease is released.
+                if lease.hooks.recorded:
+                    await self._record_lease_hook(
+                        lease, "after_lease", LeaseHookPhase.SKIPPED, "beforeLease hook failed"
+                    )
                 await self._hold(lease)
                 return
             if entry is Entry.CLEAN_UP and not lease.lease_ended.is_set():
                 # Owed cleanup of a lease still assigned: finish it as after EndSession.
-                self._phase.move(Phase.CLEANUP)
                 await self._run_cleanup(lease)
-                self._phase.move(Phase.HOLDING)
                 await self._hold(lease)
                 return
             if not lease.lease_ended.is_set():
@@ -1421,9 +1550,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
                 # The client asked to end its session: clean up while it is still
                 # connected, so it receives the afterLease output.
                 logger.info("EndSession requested, running afterLease hook")
-                self._phase.move(Phase.CLEANUP)
                 await self._run_cleanup(lease)
-                self._phase.move(Phase.HOLDING)
                 await self._hold(lease)
                 return
             if inputs.stop_now and lease.hooks.tracked and not lease.lease_ended.is_set():
@@ -1434,13 +1561,12 @@ class Exporter(AsyncContextManagerMixin, Metadata):
 
         # Released, revoked or stopping: client connections are closed before
         # cleanup touches the device.
-        self._phase.move(Phase.CLEANUP)
         await self._run_cleanup(lease)
-        self._phase.move(Phase.HOLDING)
         await self._hold(lease)
 
     async def _hold(self, lease: LeaseContext) -> None:
         """Keep the lease's session until the controller releases the lease, or a stop."""
+        self._phase.move(Phase.HOLDING)
         await self._inputs.wait_until(lambda i: lease.lease_ended.is_set() or i.stop_now)
 
     async def _run_setup(self, lease: LeaseContext) -> None:
@@ -1448,7 +1574,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
             await self._report_status(ExporterStatus.LEASE_READY, "Ready for commands")
             lease.before_lease_hook.set()
             return
-        async with self._stoppable("beforeLease"):
+        async with self._stoppable("beforeLease hook"):
             await self.hook_executor.run_before_lease_hook(
                 lease, self._report_status, self.stop, self._request_lease_release,
                 record_hook=partial(self._record_lease_hook, lease),
@@ -1458,6 +1584,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         if lease.after_lease_hook_started.is_set():
             return
         lease.after_lease_hook_started.set()
+        self._phase.move(Phase.CLEANUP)
         try:
             if (
                 self.hook_executor
@@ -1465,7 +1592,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
                 and not lease.skip_after_lease_hook
             ):
                 logger.info("Running afterLease hook")
-                async with self._stoppable("afterLease"):
+                async with self._stoppable("afterLease hook"):
                     await self.hook_executor.run_after_lease_hook(
                         lease, self._report_status, self.stop, self._request_lease_release,
                         record_hook=partial(self._record_lease_hook, lease),
@@ -1496,7 +1623,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
 
     @asynccontextmanager
     async def _stoppable(self, what: str) -> AsyncGenerator[None, None]:
-        """Run a hook so that a stop-now cuts it off after stop_grace."""
+        """Run a hook, or a record write, so that a stop-now cuts it off after stop_grace."""
         with CancelScope() as scope:
             async with create_task_group() as tg:
 
@@ -1505,7 +1632,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
                     assert inputs.stop_now_at is not None
                     scope.deadline = inputs.stop_now_at + self.stop_grace
                     left = scope.deadline - anyio.current_time()
-                    logger.info("Stop requested: %s hook may run %.1fs more", what, max(left, 0.0))
+                    logger.info("Stop requested: %s may run %.1fs more", what, max(left, 0.0))
 
                 tg.start_soon(arm)
                 try:
@@ -1513,7 +1640,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
                 finally:
                     tg.cancel_scope.cancel()
         if scope.cancelled_caught:
-            logger.warning("%s hook cut off after the %.1fs stop grace", what, self.stop_grace)
+            logger.warning("%s cut off after the %.1fs stop grace", what, self.stop_grace)
 
     @asynccontextmanager
     async def _lease_connections(self, lease: LeaseContext, *, enabled: bool) -> AsyncGenerator[None, None]:

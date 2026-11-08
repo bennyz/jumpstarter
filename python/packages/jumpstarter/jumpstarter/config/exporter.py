@@ -238,8 +238,9 @@ class ExporterConfigV1Alpha1(BaseModel):
         alias="statusStreamRetryTimeout",
         description=(
             "Seconds to retry after the controller Status stream fails or ends without a new item "
-            "(default: 1800). On expiry, the exporter exits with status 75 so a service "
-            "manager can restart it."
+            "(default: 1800), counted only while no lease is served: a served lease keeps running "
+            "until the controller is back. On expiry, the exporter stops as on SIGTERM and exits "
+            "with status 75 so a service manager can restart it."
         ),
     )
     exit_on_lease_end: bool = Field(

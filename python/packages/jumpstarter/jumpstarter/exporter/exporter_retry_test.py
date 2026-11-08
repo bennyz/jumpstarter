@@ -9,6 +9,7 @@ from grpc.aio import AioRpcError
 
 from jumpstarter.common.exceptions import CertificateDiscoveryError, ConnectionError, ExporterOfflineError
 from jumpstarter.exporter.exporter import Exporter
+from jumpstarter.exporter.lease_context import LeaseContext
 
 
 def _rpc_error(code, details=""):
@@ -103,13 +104,60 @@ async def test_retries_certificate_discovery_connection_errors():
         _rpc_error(grpc.StatusCode.NOT_FOUND),
         _rpc_error(grpc.StatusCode.INVALID_ARGUMENT),
         _rpc_error(grpc.StatusCode.UNIMPLEMENTED),
+    ],
+)
+async def test_fail_fast_rpc_errors_stop_the_exporter_without_retry(error):
+    """Losing the controller stops the exporter the way a stop-now does, so a
+    running hook still gets its stop grace instead of being cut off."""
+    calls = 0
+
+    async def stream_factory(controller):
+        nonlocal calls
+        calls += 1
+        raise error
+        yield
+
+    exporter = _make_exporter()
+    tx, _ = create_memory_object_stream(1)
+    with fail_after(2):
+        await exporter._retry_stream("Listen", stream_factory, tx, backoff=0)
+    assert calls == 1
+    expected_exit_code = (
+        75 if error.code() in (grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.PERMISSION_DENIED) else 1
+    )
+    assert exporter.exit_code == expected_exit_code
+    assert exporter._controller_stream_failed
+    stop = exporter._inputs.snapshot().stop
+    assert stop is not None and stop.now and not stop.force and not stop.unregister
+
+
+@pytest.mark.anyio
+async def test_losing_the_controller_during_a_stop_does_not_force_it():
+    """A stop-now already in progress keeps its grace: the loss is not a second stop."""
+
+    async def stream_factory(controller):
+        raise _rpc_error(grpc.StatusCode.UNAUTHENTICATED)
+        yield
+
+    exporter = _make_exporter()
+    exporter.stop()
+    tx, _ = create_memory_object_stream(1)
+    await exporter._retry_stream("Status", stream_factory, tx, backoff=0)
+    stop = exporter._inputs.snapshot().stop
+    assert stop is not None and stop.now and not stop.force
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "error",
+    [
         ConnectionError("grpc error: permission denied"),
         ConnectionError("Failed connecting to controller:443 - all IPs exhausted"),
         ExporterOfflineError("exporter offline"),
         ValueError("bad configuration"),
     ],
 )
-async def test_fail_fast_errors_propagate_without_retry(error):
+async def test_other_fail_fast_errors_propagate_without_retry(error):
     calls = 0
 
     async def stream_factory(controller):
@@ -124,14 +172,7 @@ async def test_fail_fast_errors_propagate_without_retry(error):
         await exporter._retry_stream("Listen", stream_factory, tx, backoff=0)
     assert caught.value is error
     assert calls == 1
-    if isinstance(error, AioRpcError):
-        expected_exit_code = (
-            75 if error.code() in (grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.PERMISSION_DENIED) else 1
-        )
-        assert exporter.exit_code == expected_exit_code
-        assert exporter._controller_stream_failed
-    else:
-        assert exporter.exit_code is None
+    assert exporter.exit_code is None
 
 
 @pytest.mark.anyio
@@ -149,11 +190,74 @@ async def test_status_stream_budget_expires_after_error_or_eof(ends_cleanly):
 
     exporter = _make_exporter()
     tx, _ = create_memory_object_stream(1)
-    with fail_after(2), pytest.raises(TimeoutError, match="Status stream unavailable"):
+    with fail_after(2):
         await exporter._retry_stream("Status", stream_factory, tx, backoff=0.01, outage_budget=0.06)
     assert attempts >= 2
     assert exporter.exit_code == 75
     assert exporter._controller_stream_failed
+    assert exporter._inputs.snapshot().stop_now
+
+
+@pytest.mark.anyio
+async def test_status_stream_budget_does_not_expire_while_a_lease_is_served():
+    """Client sessions go through the router and survive a controller outage:
+    keep the lease running and keep reconnecting, and apply the budget only
+    once no lease is served."""
+    attempts = 0
+
+    async def stream_factory(controller):
+        nonlocal attempts
+        attempts += 1
+        raise _rpc_error(grpc.StatusCode.UNAVAILABLE)
+        yield
+
+    exporter = _make_exporter()
+    exporter._lease_context = LeaseContext(lease_name="lease-a", before_lease_hook=Event())
+    tx, _ = create_memory_object_stream(1)
+    at_lease_end = 0
+    with fail_after(2):
+        async with create_task_group() as tg:
+            tg.start_soon(partial(
+                exporter._retry_stream, "Status", stream_factory, tx, backoff=0.01, outage_budget=0.05,
+            ))
+            await sleep(0.3)
+            assert exporter._inputs.snapshot().stop is None
+            at_lease_end = attempts
+            exporter._lease_context = None
+            with fail_after(1):
+                while exporter._inputs.snapshot().stop is None:
+                    await sleep(0.01)
+    assert 3 <= at_lease_end < 50  # it kept reconnecting, with backoff rather than a busy loop
+    assert exporter.exit_code == 75
+
+
+@pytest.mark.anyio
+async def test_status_stream_reconnect_calls_back():
+    attempts = 0
+    reconnects = 0
+
+    async def stream_factory(controller):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise _rpc_error(grpc.StatusCode.UNAVAILABLE)
+        yield attempts
+        await sleep_forever()
+
+    def on_reconnect():
+        nonlocal reconnects
+        reconnects += 1
+
+    exporter = _make_exporter()
+    tx, rx = create_memory_object_stream(1)
+    with fail_after(2):
+        async with create_task_group() as tg:
+            tg.start_soon(partial(
+                exporter._retry_stream, "Status", stream_factory, tx, backoff=0, on_reconnect=on_reconnect,
+            ))
+            assert await rx.receive() == 2
+            tg.cancel_scope.cancel()
+    assert reconnects == 1
 
 
 @pytest.mark.anyio
@@ -199,10 +303,11 @@ async def test_status_stream_budget_cancels_stalled_reconnect():
 
     exporter = _make_exporter()
     tx, _ = create_memory_object_stream(1)
-    with fail_after(2), pytest.raises(TimeoutError, match="Status stream unavailable"):
+    with fail_after(2):
         await exporter._retry_stream("Status", stream_factory, tx, backoff=0.005, outage_budget=0.06)
     assert attempts == 2
     assert exporter.exit_code == 75
+    assert exporter._inputs.snapshot().stop_now
 
 
 @pytest.mark.anyio

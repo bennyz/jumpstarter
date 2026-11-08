@@ -1,9 +1,12 @@
 """Where the exporter lifecycle is, for logs, status and debugging.
 
 The phase is a label the lifecycle sets as it moves along. It is never read to
-decide anything. Transitions are checked against ALLOWED, the same table the
-documentation diagram is drawn from: lifecycle tests run strict and fail on an
-undeclared edge, production logs it and carries on.
+decide anything. Transitions are checked against ALLOWED, the table the
+lifecycle diagram in the hooks documentation is drawn from (mermaid()). The
+exporter tests check the table against the code both ways (exporter/conftest.py):
+a transition the table does not list fails the test that takes it, and an edge
+the lifecycle tests never take fails the run. Production logs an undeclared
+transition and carries on.
 """
 
 import logging
@@ -23,11 +26,13 @@ class Phase(StrEnum):
     SERVING = "serving"
     CLEANUP = "cleanup"
     HOLDING = "holding"
+    PARKED = "parked"
     STOPPING = "stopping"
 
 
 ALLOWED: dict[Phase, frozenset[Phase]] = {
-    Phase.IDLE: frozenset({Phase.SETUP, Phase.STOPPING}),
+    # IDLE -> PARKED: the afterLease hook failed unexpectedly; no lease is admitted.
+    Phase.IDLE: frozenset({Phase.SETUP, Phase.PARKED, Phase.STOPPING}),
     # SETUP -> HOLDING: setup failed with endLease/exit. SETUP -> CLEANUP: the
     # lease ended or a stop arrived during setup. SETUP -> IDLE: the lease ended
     # before setup started, or the activity was cancelled.
@@ -35,8 +40,19 @@ ALLOWED: dict[Phase, frozenset[Phase]] = {
     Phase.SERVING: frozenset({Phase.CLEANUP, Phase.IDLE}),
     Phase.CLEANUP: frozenset({Phase.HOLDING, Phase.IDLE}),
     Phase.HOLDING: frozenset({Phase.IDLE}),
+    Phase.PARKED: frozenset({Phase.STOPPING}),
     Phase.STOPPING: frozenset(),
 }
+
+
+def mermaid() -> str:
+    """The lifecycle as a mermaid state diagram, drawn from ALLOWED."""
+    order = list(Phase)
+    lines = ["stateDiagram-v2", f"    [*] --> {Phase.IDLE}"]
+    for old in order:
+        lines += [f"    {old} --> {new}" for new in sorted(ALLOWED[old], key=order.index)]
+    lines.append(f"    {Phase.STOPPING} --> [*]")
+    return "\n".join(lines)
 
 
 class IllegalTransition(RuntimeError):

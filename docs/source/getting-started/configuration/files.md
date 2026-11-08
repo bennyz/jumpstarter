@@ -160,8 +160,11 @@ restarted exporter resumes it without running the `beforeLease` hook again. See
 [Exporter Restarts](../../introduction/hooks.md#exporter-restarts).
 
 If the controller's Status stream fails or ends, and no new update arrives
-within `statusStreamRetryTimeout` seconds, `jmp run` exits with status `75`
-(`EX_TEMPFAIL`).
+within `statusStreamRetryTimeout` seconds while no {term}`lease` is served,
+`jmp run` stops as on `SIGTERM` and exits with status `75` (`EX_TEMPFAIL`). A
+served {term}`lease` keeps running through an outage: client sessions go through
+the router, not the controller. See
+[Controller Outages](../../introduction/hooks.md#controller-outages).
 The default is 30 minutes. A service manager can then restart the exporter and
 reload its configuration. Status `1` remains the intentional shutdown code for
 a hook configured with `onFailure: exit`; units using

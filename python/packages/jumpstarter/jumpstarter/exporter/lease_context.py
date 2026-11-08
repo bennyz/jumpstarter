@@ -40,6 +40,8 @@ class LeaseContext:
         status_message: Message describing the current status
         hooks: How this process runs the lease's hooks, and what the controller's hook record
             shows of them (see lease_hooks)
+        cleanup_failure: Why the afterLease hook failed unexpectedly (not through its
+            onFailure policy); the device state is then unknown and the exporter parks
     """
 
     lease_name: str
@@ -57,6 +59,7 @@ class LeaseContext:
     status_message: str = field(default="")
     skip_after_lease_hook: bool = False
     hooks: HookPlan = field(default_factory=HookPlan)
+    cleanup_failure: str | None = None
     notify: Callable[[], None] | None = field(default=None, repr=False)
     """Wakes the exporter lifecycle; called after setting a lease-local flag."""
 

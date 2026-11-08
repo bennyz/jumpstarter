@@ -862,8 +862,8 @@ class HookExecutor:
 
         except HookExecutionError as e:
             # warn returns a warning string; only endLease/exit normally raise this error.
-            await record("before_lease", LeaseHookPhase.FAILED, str(e), e.on_failure)
             if e.should_shutdown_exporter():
+                await record("before_lease", LeaseHookPhase.FAILED, str(e), e.on_failure)
                 # on_failure='exit' - defer shutdown until client handles the failure
                 logger.error("beforeLease hook failed with on_failure='exit': %s", e)
                 lease_scope.skip_after_lease_hook = True
@@ -889,6 +889,9 @@ class HookExecutor:
                     ExporterStatus.BEFORE_LEASE_HOOK_FAILED,
                     f"beforeLease hook failed (on_failure=endLease): {e}",
                 )
+                # Recorded after the client sees the failure: a controller that
+                # keeps the record ends the lease as soon as it is recorded.
+                await record("before_lease", LeaseHookPhase.FAILED, str(e), e.on_failure)
 
         except Exception as e:  # noqa: BLE001
             logger.error("beforeLease hook failed with unexpected error: %s", e)
@@ -984,8 +987,8 @@ class HookExecutor:
 
         except HookExecutionError as e:
             # warn returns a warning string; only endLease/exit normally raise this error.
-            await record("after_lease", LeaseHookPhase.FAILED, str(e), e.on_failure)
             if e.should_shutdown_exporter():
+                await record("after_lease", LeaseHookPhase.FAILED, str(e), e.on_failure)
                 # on_failure='exit' - shut down the entire exporter
                 logger.exception("afterLease hook failed with on_failure='exit'")
                 await report_status(
@@ -1014,11 +1017,16 @@ class HookExecutor:
                     ExporterStatus.AFTER_LEASE_HOOK_FAILED,
                     f"afterLease hook failed (on_failure=endLease): {e}",
                 )
+                # Recorded after the client sees the failure: a controller that
+                # keeps the record ends the lease as soon as it is recorded.
+                await record("after_lease", LeaseHookPhase.FAILED, str(e), e.on_failure)
 
         except Exception as e:  # noqa: BLE001
-            # Unexpected errors: report failure but do not shut down.
+            # Unexpected errors leave the device in an unknown state: report the
+            # failure, and the exporter parks instead of admitting another lease.
             # An orchestration error is not an explicit endLease hook failure.
             logger.error("afterLease hook failed with unexpected error: %s", e)
+            lease_scope.cleanup_failure = str(e)
             await record("after_lease", LeaseHookPhase.FAILED, str(e))
             await report_status(
                 ExporterStatus.AFTER_LEASE_HOOK_FAILED,

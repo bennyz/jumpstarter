@@ -77,6 +77,8 @@ class HookPlan:
         attempts: the attempt each hook runs (or fails) as; 1 unless a restart cut it off
         started: the attempt the record shows as started, per hook
         cut_off: failure message per hook a restart cut off that fails instead of running again
+        controller_ends_lease: the controller recorded a hook failure with onFailure:
+            endLease, and ends the lease itself; this process must not release it
     """
 
     tracked: bool = False
@@ -85,6 +87,7 @@ class HookPlan:
     attempts: dict[HookType, int] = field(default_factory=dict)
     started: dict[HookType, int] = field(default_factory=dict)
     cut_off: dict[HookType, str] = field(default_factory=dict)
+    controller_ends_lease: bool = False
 
     def attempt(self, hook: HookType) -> int:
         """The attempt the hook runs (or fails) as."""

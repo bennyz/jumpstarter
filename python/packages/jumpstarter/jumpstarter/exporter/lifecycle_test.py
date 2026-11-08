@@ -97,9 +97,11 @@ class FakeController(jumpstarter_pb2_grpc.ControllerServiceServicer):
     record: jumpstarter_pb2.LeaseHooks = field(default_factory=jumpstarter_pb2.LeaseHooks)
     record_writes: list[tuple[str, str, LeaseHookPhase, int]] = field(default_factory=list)
     assigned: tuple[str, str, str] | None = None  # (lease, uid, client)
+    down: grpc.StatusCode | None = None
+    """While set, every call fails with this code, and the open Status stream ends with it."""
 
     def __post_init__(self):
-        self._status_tx, self._status_rx = create_memory_object_stream[jumpstarter_pb2.StatusResponse](64)
+        self._status_tx, self._status_rx = create_memory_object_stream[jumpstarter_pb2.StatusResponse | None](64)
         self._dial_tx, self._dial_rx = create_memory_object_stream[str](64)
 
     def _status(self) -> jumpstarter_pb2.StatusResponse:
@@ -129,6 +131,17 @@ class FakeController(jumpstarter_pb2_grpc.ControllerServiceServicer):
         """A client dials the current lease; the exporter hears it on Listen."""
         self._dial_tx.send_nowait(token)
 
+    def go_down(self, code: grpc.StatusCode = grpc.StatusCode.UNAVAILABLE) -> None:
+        self.down = code
+        self._status_tx.send_nowait(None)  # ends the open Status stream
+
+    def come_back(self) -> None:
+        self.down = None
+
+    async def _fail_if_down(self, context) -> None:
+        if self.down is not None:
+            await context.abort(self.down, "controller unavailable")
+
     # --- observing -----------------------------------------------------------
     def statuses(self) -> list[ExporterStatus]:
         return [s for _, s, _ in self.reports]
@@ -146,6 +159,7 @@ class FakeController(jumpstarter_pb2_grpc.ControllerServiceServicer):
 
     # --- ControllerService ---------------------------------------------------
     async def Register(self, request, context):
+        await self._fail_if_down(context)
         self.registered += 1
         return jumpstarter_pb2.RegisterResponse(uuid="00000000-0000-0000-0000-000000000000")
 
@@ -154,6 +168,7 @@ class FakeController(jumpstarter_pb2_grpc.ControllerServiceServicer):
         return jumpstarter_pb2.UnregisterResponse()
 
     async def ReportStatus(self, request, context):
+        await self._fail_if_down(context)
         self.reports.append((time.monotonic(), S.from_proto(request.status), request.message))
         return jumpstarter_pb2.ReportStatusResponse()
 
@@ -168,7 +183,9 @@ class FakeController(jumpstarter_pb2_grpc.ControllerServiceServicer):
 
     async def UpdateLeaseHooks(self, request, context):
         """The controller's record rules, as in #1208: only the assigned lease starts setup,
-        an outcome must match the running attempt, a new lease replaces the record."""
+        an outcome must match the running attempt, a new lease replaces the record, and
+        a failure with onFailure: endLease ends the assigned lease."""
+        await self._fail_if_down(context)
         if not self.records:
             await context.abort(grpc.StatusCode.UNIMPLEMENTED, "no hook records")
         hook = "before_lease" if request.HasField("before_lease") else "after_lease"
@@ -192,11 +209,19 @@ class FakeController(jumpstarter_pb2_grpc.ControllerServiceServicer):
             await context.abort(grpc.StatusCode.FAILED_PRECONDITION, "outcome of an attempt that is not running")
         getattr(self.record, hook).CopyFrom(state)
         self.record_writes.append((request.lease_name, hook, phase, state.attempts))
+        if assigned and phase == LeaseHookPhase.FAILED and (
+            state.on_failure == jumpstarter_pb2.LEASE_HOOK_FAILURE_ACTION_END_LEASE
+        ):
+            self.unassign()
         return self.record
 
     async def Status(self, request, context):
+        await self._fail_if_down(context)
         yield self._status()  # the current state as the stream opens, as the controller does
         async for status in self._status_rx:
+            if status is None:  # go_down(); one queued before this stream opened is stale
+                await self._fail_if_down(context)
+                continue
             if self.records:  # always the latest record, whenever the message was queued
                 status.lease_hooks.CopyFrom(self.record)
             yield status
@@ -261,9 +286,11 @@ class Harness:
 @asynccontextmanager
 async def running(
     tmp_path, *, before=None, after=None, exit_on_lease_end=False, stop_grace=None, records=False, controller=None,
+    status_stream_retry_timeout=None, wait_ready=True,
 ):
     """One exporter process against a fake controller. Pass a previous run's
-    controller to start the next process of the same exporter against it."""
+    controller to start the next process of the same exporter against it.
+    wait_ready=False yields as soon as the exporter starts, before it registers."""
     reused = controller is not None
     controller = controller or FakeController(records=records)
     registered_before = controller.registered
@@ -299,6 +326,8 @@ async def running(
     )
     if stop_grace is not None:
         exporter.stop_grace = stop_grace
+    if status_stream_retry_timeout is not None:
+        exporter.status_stream_retry_timeout = status_stream_retry_timeout
     h = Harness(controller, router, exporter, tmp_path / "hooks.log", anyio.Event())
 
     async def serve():
@@ -312,11 +341,11 @@ async def running(
     try:
         async with create_task_group() as tg:
             tg.start_soon(serve)
-            if reused:  # a later process of the same exporter: it may resume a lease rather than go idle
+            if wait_ready and reused:  # a later process of the same exporter: it may resume a lease
                 with fail_after(10):
                     while controller.registered <= registered_before:
                         await anyio.sleep(0.01)
-            else:
+            elif wait_ready:
                 await controller.wait_for(S.AVAILABLE)  # registered and idle
             yield h
             tg.cancel_scope.cancel()
@@ -551,6 +580,18 @@ async def test_second_stop_forces_an_immediate_exit(tmp_path):
         assert took < 3
 
 
+async def test_second_stop_during_setup_forces_an_immediate_exit(tmp_path):
+    log = tmp_path / "hooks.log"
+    async with running(tmp_path, before=hook(log, "before", sleep=30), stop_grace=30.0) as h:
+        h.controller.assign("lease-a")
+        await h.controller.wait_for(S.BEFORE_LEASE_HOOK)
+        h.exporter.stop(should_unregister=True)
+        await anyio.sleep(0.2)
+        h.exporter.stop(should_unregister=True)
+        took = await h.wait_returned(8)
+        assert took < 3
+
+
 async def test_stop_now_while_idle_unregisters(tmp_path):
     async with running(tmp_path) as h:
         h.exporter.stop(should_unregister=True)
@@ -608,3 +649,152 @@ async def test_latest_assignment_wins_over_an_intermediate_one(tmp_path):
         runs = h.hook_runs()
         assert "before lease-b" not in runs
         assert runs[-1] == "before lease-c"
+
+
+# ── the device state is unknown: park ────────────────────────────────────────
+
+
+def _fail_cleanup_unexpectedly(monkeypatch) -> None:
+    """An error outside the hook's onFailure policy, as an exporter bug would raise.
+    Nothing a hook script does produces one, so this is the one internal seam here."""
+    execute = HookExecutor._execute_hook
+
+    async def failing(self, hook_config, lease_scope, log_source):
+        if hook_config is self.config.after_lease:
+            raise RuntimeError("lost track of the device")
+        return await execute(self, hook_config, lease_scope, log_source)
+
+    monkeypatch.setattr(HookExecutor, "_execute_hook", failing)
+
+
+async def test_unexpected_cleanup_failure_parks_the_exporter(tmp_path, monkeypatch):
+    _fail_cleanup_unexpectedly(monkeypatch)
+    log = tmp_path / "hooks.log"
+    async with running(tmp_path, before=hook(log, "before"), after=hook(log, "after")) as h:
+        h.controller.assign("lease-a")
+        await h.controller.wait_for(S.LEASE_READY)
+        h.controller.unassign()
+        await h.controller.wait_for(S.AFTER_LEASE_HOOK_FAILED)
+        h.controller.assign("lease-b")
+        await anyio.sleep(1.0)
+        assert h.hook_runs() == ["before lease-a"]
+        assert S.AVAILABLE not in h.controller.statuses_since(S.AFTER_LEASE_HOOK_FAILED)
+        h.exporter.stop(should_unregister=True)
+        await h.wait_returned(5)
+
+
+async def test_restart_clears_a_park(tmp_path, monkeypatch):
+    _fail_cleanup_unexpectedly(monkeypatch)
+    log = tmp_path / "hooks.log"
+    async with running(tmp_path, before=hook(log, "before"), after=hook(log, "after"), records=True) as h:
+        h.controller.assign("lease-a")
+        await h.controller.wait_for(S.LEASE_READY)
+        h.controller.unassign()
+        await h.controller.wait_for(S.AFTER_LEASE_HOOK_FAILED)
+        h.exporter.stop()
+        await h.wait_returned(5)
+    controller = h.controller
+    available = controller.statuses().count(S.AVAILABLE)
+    async with running(tmp_path, before=hook(log, "before"), after=hook(log, "after"), controller=controller) as h:
+        await controller.wait_for(S.AVAILABLE, count=available + 1)
+        controller.assign("lease-b")
+        await controller.wait_for(S.LEASE_READY, count=2)
+        assert h.hook_runs() == ["before lease-a", "before lease-b"]
+
+
+# ── the controller ends a lease after a recorded endLease failure ────────────
+
+
+async def test_controller_ends_the_lease_after_a_recorded_end_lease_failure(tmp_path):
+    log = tmp_path / "hooks.log"
+    before = hook(log, "before", exit_code=1, on_failure="endLease")
+    async with running(tmp_path, before=before, after=hook(log, "after"), records=True) as h:
+        h.controller.assign("lease-a")
+        await h.controller.wait_for(S.AVAILABLE, count=2)
+        assert h.controller.releases == []  # the controller ended it, not a ReleaseLease call
+        assert h.controller.assigned is None
+        # The record owes no cleanup, or the controller would hold the exporter for it.
+        assert h.controller.hook_phase("after_lease") == LeaseHookPhase.SKIPPED
+        assert h.controller.statuses_since(S.BEFORE_LEASE_HOOK) == [
+            S.BEFORE_LEASE_HOOK, S.BEFORE_LEASE_HOOK_FAILED, S.AVAILABLE,
+        ]
+        assert h.hook_runs() == ["before lease-a"]
+
+
+# ── controller outages ───────────────────────────────────────────────────────
+
+
+async def test_lease_keeps_running_through_a_controller_outage(tmp_path):
+    """Client sessions go through the router, so they survive the controller
+    going away: the lease keeps running past the outage budget."""
+    log = tmp_path / "hooks.log"
+    async with running(tmp_path, after=hook(log, "after"), status_stream_retry_timeout=0.5) as h:
+        h.controller.assign("lease-a")
+        await h.controller.wait_for(S.LEASE_READY)
+        h.controller.dial("conn-1")
+        await h.wait_opened("conn-1")
+        h.controller.go_down()
+        await anyio.sleep(2.0)
+        assert not h.done.is_set()
+        assert "conn-1" not in h.router.closed
+        h.controller.come_back()
+        h.controller.unassign()
+        await h.controller.wait_for(S.AVAILABLE, count=2, timeout=15)
+        assert h.hook_runs() == ["after lease-a"]
+        assert h.exporter.exit_code is None
+
+
+async def test_idle_exporter_gives_up_after_the_outage_budget(tmp_path):
+    async with running(tmp_path, status_stream_retry_timeout=0.5) as h:
+        h.controller.go_down()
+        await h.wait_returned(10)
+        assert h.exporter.exit_code == 75
+        assert h.controller.unregistered == 0
+
+
+async def test_status_is_sent_again_once_the_controller_is_back(tmp_path):
+    """A report can be lost during an outage, and the controller clears an
+    Offline status when the exporter reconnects: say the current one again."""
+    async with running(tmp_path) as h:
+        h.controller.assign("lease-a")
+        await h.controller.wait_for(S.LEASE_READY)
+        h.controller.go_down()
+        await anyio.sleep(1.0)
+        h.controller.come_back()
+        await h.controller.wait_for(S.LEASE_READY, count=2, timeout=15)
+
+
+async def test_losing_the_controller_during_a_hook_gives_it_the_stop_grace(tmp_path):
+    """Rejected credentials stop the exporter as SIGTERM does, not by cancelling
+    whatever is running: the hook gets stop_grace, as it would for a stop."""
+    log = tmp_path / "hooks.log"
+    async with running(tmp_path, before=hook(log, "before", sleep=30), stop_grace=1.0) as h:
+        h.controller.assign("lease-a")
+        await h.controller.wait_for(S.BEFORE_LEASE_HOOK)
+        h.controller.go_down(grpc.StatusCode.UNAUTHENTICATED)
+        took = await h.wait_returned(8)
+        assert 0.8 <= took < 5
+        assert h.exporter.exit_code == 75
+
+
+async def test_registration_waits_for_the_controller(tmp_path):
+    controller = FakeController()
+    controller.go_down()
+    async with running(tmp_path, controller=controller, wait_ready=False) as h:
+        await anyio.sleep(1.5)  # at least one failed attempt
+        assert not h.done.is_set()
+        controller.come_back()
+        await controller.wait_for(S.AVAILABLE, timeout=10)
+        assert controller.registered == 1
+
+
+async def test_stop_while_waiting_to_register_exits_promptly(tmp_path):
+    controller = FakeController()
+    controller.go_down()
+    async with running(tmp_path, controller=controller, wait_ready=False) as h:
+        await anyio.sleep(0.5)
+        h.exporter.stop(should_unregister=True)
+        took = await h.wait_returned(5)
+        assert took < 2
+        assert controller.registered == 0
+        assert controller.unregistered == 0

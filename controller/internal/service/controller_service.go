@@ -618,32 +618,60 @@ func (s *ControllerService) handleExporterLeaseRelease(
 		return fmt.Errorf("lease %s is not held by exporter %s", lease.Name, exporter.Name)
 	}
 
-	// Check if lease is already ended or marked for release
-	if lease.Status.Ended || lease.Spec.Release {
-		outcome := "already_released"
-		if lease.Status.Ended {
-			outcome = "already_ended"
-		}
-		logger.Info("Lease release request is idempotent", "outcome", outcome)
-		return nil
+	outcome, err := s.markLeaseForRelease(ctx, &lease)
+	if err != nil {
+		return err
 	}
+	if outcome == leaseNewlyMarked {
+		logger.Info("Lease marked for release by exporter", "outcome", outcome)
+	} else {
+		logger.Info("Lease release request is idempotent", "outcome", outcome)
+	}
+	return nil
+}
 
-	// Set the release flag to trigger lease end via the reconciler
+const leaseNewlyMarked = "newly_marked"
+
+// markLeaseForRelease has the lease reconciler end the lease, unless it has
+// already ended or been marked for release. It returns the outcome, for logs.
+func (s *ControllerService) markLeaseForRelease(
+	ctx context.Context,
+	lease *jumpstarterdevv1alpha1.Lease,
+) (string, error) {
+	if lease.Status.Ended {
+		return "already_ended", nil
+	}
+	if lease.Spec.Release {
+		return "already_released", nil
+	}
 	original := client.MergeFrom(lease.DeepCopy())
 	lease.Spec.Release = true
-
-	if err := s.Client.Patch(ctx, &lease, original); err != nil {
-		return fmt.Errorf("failed to mark lease for release: %w", err)
+	if err := s.Client.Patch(ctx, lease, original); err != nil {
+		return "", fmt.Errorf("failed to mark lease for release: %w", err)
 	}
+	return leaseNewlyMarked, nil
+}
 
-	logger.Info("Lease marked for release by exporter", "outcome", "newly_marked")
-
-	return nil
+// hookFailureEndsLease reports whether the update records a hook failure whose
+// onFailure action ends the lease.
+func hookFailureEndsLease(req *pb.UpdateLeaseHooksRequest) bool {
+	var state *pb.LeaseHookState
+	switch hook := req.GetHook().(type) {
+	case *pb.UpdateLeaseHooksRequest_BeforeLease:
+		state = hook.BeforeLease
+	case *pb.UpdateLeaseHooksRequest_AfterLease:
+		state = hook.AfterLease
+	}
+	return state.GetPhase() == pb.LeaseHookPhase_LEASE_HOOK_PHASE_FAILED &&
+		state.GetOnFailure() == pb.LeaseHookFailureAction_LEASE_HOOK_FAILURE_ACTION_END_LEASE
 }
 
 // UpdateLeaseHooks records a lifecycle hook transition in the exporter's lease
 // hook record (Status.LeaseHooks). Exporters call it before starting a hook and
 // after it finishes, so the record outlives the exporter process.
+//
+// A recorded failure with onFailure: endLease ends the assigned lease here, so
+// the lease ends even if the exporter stops before it could release it.
 func (s *ControllerService) UpdateLeaseHooks(
 	ctx context.Context,
 	req *pb.UpdateLeaseHooksRequest,
@@ -663,6 +691,7 @@ func (s *ControllerService) UpdateLeaseHooks(
 	// Validation reads the record, so patch with an optimistic lock and re-read
 	// on conflict rather than overwrite a concurrent change.
 	first := true
+	var lease *jumpstarterdevv1alpha1.Lease
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		if !first {
 			if err := s.Client.Get(ctx, client.ObjectKeyFromObject(exporter), exporter); err != nil {
@@ -670,7 +699,8 @@ func (s *ControllerService) UpdateLeaseHooks(
 			}
 		}
 		first = false
-		lease, err := s.assignedLease(ctx, exporter)
+		var err error
+		lease, err = s.assignedLease(ctx, exporter)
 		if err != nil {
 			return err
 		}
@@ -700,6 +730,15 @@ func (s *ControllerService) UpdateLeaseHooks(
 	}
 
 	logger.Info("Recorded lease hook state", "leaseHooks", exporter.Status.LeaseHooks)
+	// Checked on retries of an unchanged update too: the release may be what failed.
+	if lease != nil && string(lease.UID) == req.GetLeaseUid() && hookFailureEndsLease(req) {
+		outcome, err := s.markLeaseForRelease(ctx, lease)
+		if err != nil {
+			logger.Error(err, "unable to end the lease after its endLease hook failure")
+			return nil, status.Errorf(codes.Internal, "unable to end the lease: %s", err)
+		}
+		logger.Info("Ending lease after its endLease hook failure", "outcome", outcome)
+	}
 	return exporter.Status.LeaseHooks.ToProtobuf(), nil
 }
 

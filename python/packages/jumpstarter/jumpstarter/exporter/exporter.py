@@ -47,6 +47,7 @@ from jumpstarter.exporter.lease_hooks import (
     HOOK_NAMES,
     HookPlan,
     HookType,
+    RecordState,
     Restart,
     decide_restart,
 )
@@ -126,7 +127,7 @@ def _note_recorded(
 ) -> None:
     """What a written hook transition tells this process about the lease."""
     if hook == "before_lease":
-        lease.hooks.recorded = True
+        lease.hooks.record = RecordState.RECORDED
     if phase == LeaseHookPhase.RUNNING:
         lease.hooks.started[hook] = attempts
     if phase == LeaseHookPhase.FAILED and failure_ends_lease(on_failure):
@@ -509,7 +510,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
                         "Controller does not record lease hooks; the hooks of lease %s run without a record",
                         lease.lease_name,
                     )
-                    lease.hooks.tracked = False
+                    lease.hooks.record = RecordState.UNTRACKED
                     return True
                 if code in _LEASE_HOOK_REFUSED_CODES:
                     logger.warning("Controller refused to %s for lease %s", description, lease.lease_name)
@@ -1316,7 +1317,9 @@ class Exporter(AsyncContextManagerMixin, Metadata):
                 before_lease_hook=Event(),
                 client_name=a.client_name,
                 # Hook records identify a lease by its UID, which every controller that keeps them sends.
-                hooks=HookPlan(tracked=self._tracks_lease_hooks and bool(a.lease_uid)),
+                hooks=HookPlan(
+                    record=RecordState.TRACKED if self._tracks_lease_hooks and a.lease_uid else RecordState.UNTRACKED
+                ),
             )
             parked = await self._serve_lease(lease, Entry.NEW, self._lease_log_context(a))
         if parked is not None:
@@ -1354,7 +1357,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
             lease_name=record.lease_name,
             lease_uid=record.lease_uid,
             before_lease_hook=Event(),
-            hooks=HookPlan(tracked=True, recorded=True),
+            hooks=HookPlan(record=RecordState.RECORDED),
             client_name=record.client_name,  # kept by the record, as the lease may have ended
         )
         handled = inputs.generation if assigned is not None else None

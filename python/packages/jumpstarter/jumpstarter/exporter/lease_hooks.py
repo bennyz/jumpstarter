@@ -64,14 +64,24 @@ def decide_restart(record: jumpstarter_pb2.LeaseHooks, assigned: tuple[str, str]
     return Restart.CLEAN_UP  # the lease ended while no process served it
 
 
+class RecordState(Enum):
+    """Whether the controller keeps this lease's hook record."""
+
+    UNTRACKED = auto()
+    """No record: an older controller, an exitOnLeaseEnd or standalone exporter, or no lease UID."""
+    TRACKED = auto()
+    """Transitions are recorded, but no record of this lease exists yet."""
+    RECORDED = auto()
+    """The controller holds a hook record for this lease."""
+
+
 @dataclass
 class HookPlan:
     """How this exporter process runs a lease's hooks, and what the controller's record shows.
 
     Attributes:
-        tracked: hook transitions are recorded with the controller, so the lease can
+        record: whether the controller keeps the lease's hook record, so the lease can
             outlive this process (see Exporter._record_lease_hook)
-        recorded: the controller holds a hook record for this lease
         resumed: the status to report for a lease whose setup ran in an earlier
             process, or that is in cleanup; None if setup runs in this one
         attempts: the attempt each hook runs (or fails) as; 1 unless a restart cut it off
@@ -81,13 +91,22 @@ class HookPlan:
             endLease, and ends the lease itself; this process must not release it
     """
 
-    tracked: bool = False
-    recorded: bool = False
+    record: RecordState = RecordState.UNTRACKED
     resumed: tuple[ExporterStatus, str] | None = None
     attempts: dict[HookType, int] = field(default_factory=dict)
     started: dict[HookType, int] = field(default_factory=dict)
     cut_off: dict[HookType, str] = field(default_factory=dict)
     controller_ends_lease: bool = False
+
+    @property
+    def tracked(self) -> bool:
+        """Hook transitions are recorded with the controller."""
+        return self.record is not RecordState.UNTRACKED
+
+    @property
+    def recorded(self) -> bool:
+        """The controller holds a hook record for this lease."""
+        return self.record is RecordState.RECORDED
 
     def attempt(self, hook: HookType) -> int:
         """The attempt the hook runs (or fails) as."""

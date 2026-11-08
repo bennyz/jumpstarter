@@ -5,19 +5,16 @@ decide anything. Transitions are checked against ALLOWED, the table the
 lifecycle diagram in the hooks documentation is drawn from (mermaid()). The
 exporter tests check the table against the code both ways (exporter/conftest.py):
 a transition the table does not list fails the test that takes it, and an edge
-the lifecycle tests never take fails the run. Production logs an undeclared
-transition and carries on.
+the lifecycle tests never take fails the run. Here an undeclared transition is
+logged, and the lifecycle carries on.
 """
 
 import logging
-import os
 from enum import StrEnum
 
 import anyio
 
 logger = logging.getLogger(__name__)
-
-STRICT_ENV = "JUMPSTARTER_STRICT_LIFECYCLE"
 
 
 class Phase(StrEnum):
@@ -55,15 +52,10 @@ def mermaid() -> str:
     return "\n".join(lines)
 
 
-class IllegalTransition(RuntimeError):
-    pass
-
-
 class PhaseTracker:
-    def __init__(self, strict: bool | None = None) -> None:
+    def __init__(self) -> None:
         self._phase = Phase.IDLE
         self._since = 0.0
-        self._strict = os.environ.get(STRICT_ENV) == "1" if strict is None else strict
 
     @property
     def current(self) -> Phase:
@@ -74,8 +66,6 @@ class PhaseTracker:
         if new == old:
             return
         if new not in ALLOWED[old]:
-            if self._strict:
-                raise IllegalTransition(f"{old} -> {new}")
             logger.error("Illegal lifecycle transition %s -> %s", old, new)
         now = anyio.current_time()
         if old != Phase.IDLE:

@@ -31,11 +31,16 @@ class Assignment:
 
 @dataclass(frozen=True)
 class StopRequest:
-    now: bool
-    """True: stop as soon as possible. False: drain, stop once no lease is served."""
+    now_at: float | None
+    """anyio clock time of the first stop-now: stop as soon as possible, a running
+    hook getting the stop grace from then. None: drain, stop once no lease is served."""
     unregister: bool
     force: bool = False
     """A second stop-now: skip every remaining grace period."""
+
+    @property
+    def now(self) -> bool:
+        return self.now_at is not None
 
 
 @dataclass(frozen=True)
@@ -45,8 +50,6 @@ class Inputs:
     """Bumped whenever the assigned lease changes, including to and from none,
     so a lease that is released and assigned again is a new admission."""
     stop: StopRequest | None = None
-    stop_now_at: float | None = None
-    """anyio clock time of the first stop-now request."""
     status_seen: bool = False
     """At least one Status message arrived: the assignment and hook record are known."""
     hook_record: jumpstarter_pb2.LeaseHooks | None = None
@@ -104,16 +107,15 @@ class InputBuffer:
     def request_stop(self, *, now: bool, unregister: bool) -> StopRequest:
         current = self._inputs
         previous = current.stop
-        force = previous is not None and previous.now and now
+        now_at = previous.now_at if previous is not None else None
+        if now and now_at is None:
+            now_at = anyio.current_time()
         stop = StopRequest(
-            now=now or (previous is not None and previous.now),
+            now_at=now_at,
             unregister=unregister or (previous is not None and previous.unregister),
-            force=force or (previous is not None and previous.force),
+            force=(now and previous is not None and previous.now) or (previous is not None and previous.force),
         )
-        stop_now_at = current.stop_now_at
-        if stop.now and stop_now_at is None:
-            stop_now_at = anyio.current_time()
-        self._publish(replace(current, stop=stop, stop_now_at=stop_now_at))
+        self._publish(replace(current, stop=stop))
         return stop
 
     def _publish(self, inputs: Inputs) -> None:

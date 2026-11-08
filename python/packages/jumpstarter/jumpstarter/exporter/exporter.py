@@ -343,21 +343,11 @@ class Exporter(AsyncContextManagerMixin, Metadata):
     is needed during cleanup.
     """
 
-    _unregister: bool = field(init=False, default=False)
-    """Internal flag indicating whether to actively unregister during shutdown.
-
-    Set when stop(should_unregister=True) is called. When False, relies on
-    heartbeat timeout for implicit unregistration.
-    """
-
     _inputs: InputBuffer = field(init=False, default_factory=InputBuffer)
     """Latest controller assignment and stop request, read by the lifecycle."""
 
     _phase: PhaseTracker = field(init=False, default_factory=PhaseTracker)
     """Where the lifecycle is. A label for logs; never read to decide."""
-
-    _forced: bool = field(init=False, default=False)
-    """A second stop-now cancelled everything; skip cleanup on the way out."""
 
     _tg: TaskGroup | None = field(init=False, default=None)
     """Reference to the anyio TaskGroup managing concurrent tasks.
@@ -546,8 +536,6 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         stop = self._inputs.request_stop(now=not wait_for_lease_exit, unregister=should_unregister)
         if stop.force:
             logger.warning("Repeated stop request: stopping immediately, skipping remaining hook grace")
-            self._forced = True
-            self._unregister = stop.unregister
             if self._tg is not None:
                 self._tg.cancel_scope.cancel()
         elif stop.now:
@@ -1117,7 +1105,8 @@ class Exporter(AsyncContextManagerMixin, Metadata):
 
     async def _unregister_with_controller(self):
         """Safely unregister from controller with timeout and error handling."""
-        if not (self._registered and self._unregister):
+        stop = self._inputs.snapshot().stop
+        if not (self._registered and stop is not None and stop.unregister):
             return
 
         logger.info("Unregistering exporter with controller")
@@ -1333,8 +1322,6 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         if parked is not None:
             await self._park(parked)
         self._phase.move(Phase.STOPPING)
-        stop = self._inputs.snapshot().stop
-        self._unregister = stop.unregister if stop is not None else False
 
     async def _take_over_from_previous_process(self, inputs: Inputs) -> tuple[int | None, str | None]:
         """Pick up what a previous exporter process left of its last lease, before anything else.
@@ -1610,7 +1597,8 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         still runs, bounded by stop_grace, as it did when the exporter shut down
         mid-lease.
         """
-        if self._forced or lease.hooks.tracked or lease.after_lease_hook_started.is_set():
+        stop = self._inputs.snapshot().stop
+        if (stop is not None and stop.force) or lease.hooks.tracked or lease.after_lease_hook_started.is_set():
             return
         with CancelScope(shield=True, deadline=anyio.current_time() + self.stop_grace):
             await self._run_cleanup(lease)
@@ -1623,8 +1611,8 @@ class Exporter(AsyncContextManagerMixin, Metadata):
 
                 async def arm() -> None:
                     inputs = await self._inputs.wait_until(lambda i: i.stop_now)
-                    assert inputs.stop_now_at is not None
-                    scope.deadline = inputs.stop_now_at + self.stop_grace
+                    assert inputs.stop is not None and inputs.stop.now_at is not None
+                    scope.deadline = inputs.stop.now_at + self.stop_grace
                     left = scope.deadline - anyio.current_time()
                     logger.info("Stop requested: %s may run %.1fs more", what, max(left, 0.0))
 

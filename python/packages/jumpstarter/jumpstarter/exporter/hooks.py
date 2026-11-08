@@ -9,6 +9,7 @@ import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Literal, Protocol
 
 import anyio
@@ -99,6 +100,16 @@ def failure_ends_lease(on_failure: str) -> bool:
     to its client or its expiry, and 'warn' continues.
     """
     return on_failure == "endLease"
+
+
+class SetupOutcome(Enum):
+    """What a lease needs once its beforeLease hook is settled."""
+
+    CLEAN_UP = auto()
+    """Run the afterLease hook when the lease ends (setup ran, warned or failed unexpectedly)."""
+    NO_CLEANUP = auto()
+    """Hold the lease until it is released without cleanup: setup failed with
+    endLease or exit, or never started in a process that set nothing up."""
 
 
 @dataclass
@@ -719,16 +730,16 @@ class HookExecutor:
             await record(hook, LeaseHookPhase.SUCCEEDED)
 
     @staticmethod
-    async def _setup_did_not_start(lease_scope: "LeaseContext", record: RecordHook) -> None:
+    async def _setup_did_not_start(lease_scope: "LeaseContext", record: RecordHook) -> SetupOutcome:
         """Settle a setup that never ran in this process.
 
         Only a previous process's setup needs cleanup. Even a fresh start can
         have a record if the controller stored it but its reply was lost, so
         close that possible record before skipping cleanup.
         """
-        if not lease_scope.hooks.recorded:
-            lease_scope.skip_after_lease_hook = True
+        outcome = SetupOutcome.CLEAN_UP if lease_scope.hooks.recorded else SetupOutcome.NO_CLEANUP
         await close_setup_record(lease_scope, record, "beforeLease hook did not start before its lease ended")
+        return outcome
 
     async def _safe_release_lease(
         self,
@@ -776,7 +787,7 @@ class HookExecutor:
         shutdown: Callable[..., None],
         request_lease_release: Callable[["LeaseContext"], Awaitable[None]] | None = None,
         record_hook: RecordHook | None = None,
-    ) -> None:
+    ) -> SetupOutcome:
         """Execute before-lease hook with full orchestration.
 
         This method handles the complete lifecycle of running a before-lease hook:
@@ -797,21 +808,22 @@ class HookExecutor:
         """
         record = record_hook or _record_nothing
         should_release = False
+        outcome = SetupOutcome.CLEAN_UP
         try:
             if not await self._check_lease_ready(lease_scope, report_status):
                 if lease_scope.lease_ended.is_set():
-                    await self._setup_did_not_start(lease_scope, record)
-                return
+                    outcome = await self._setup_did_not_start(lease_scope, record)
+                return outcome
 
             # Check if hook is configured
             if not self.config.before_lease:
                 logger.debug("No before-lease hook configured")
                 if not await record("before_lease", LeaseHookPhase.SKIPPED):
                     logger.warning("Not making lease %s ready: its start was not recorded", lease_scope.lease_name)
-                    lease_scope.skip_after_lease_hook = True
-                    return
+                    outcome = SetupOutcome.NO_CLEANUP
+                    return outcome
                 await report_status(ExporterStatus.LEASE_READY, "Ready for commands")
-                return
+                return outcome
 
             # Skip hook if lease already ended (e.g. stale lease from backlog
             # when the exporter couldn't keep up with lease churn)
@@ -820,20 +832,20 @@ class HookExecutor:
                     "Lease %s already ended, skipping beforeLease hook",
                     lease_scope.lease_name,
                 )
-                await self._setup_did_not_start(lease_scope, record)
-                return
+                outcome = await self._setup_did_not_start(lease_scope, record)
+                return outcome
 
             if not await self._record_start("before_lease", lease_scope, record):
                 logger.warning("Not running beforeLease hook for lease %s: its start was not recorded",
                                lease_scope.lease_name)
-                await self._setup_did_not_start(lease_scope, record)
-                return
+                outcome = await self._setup_did_not_start(lease_scope, record)
+                return outcome
 
-            # Recording can wait on the controller while the lease ends or cleanup
-            # settles a timed-out start. A late acknowledgement must not run setup.
-            if lease_scope.lease_ended.is_set() or lease_scope.after_lease_hook_started.is_set():
-                await self._setup_did_not_start(lease_scope, record)
-                return
+            # Recording can wait on the controller while the lease ends. A late
+            # acknowledgement must not run setup.
+            if lease_scope.lease_ended.is_set():
+                outcome = await self._setup_did_not_start(lease_scope, record)
+                return outcome
 
             await report_status(ExporterStatus.BEFORE_LEASE_HOOK, "Running beforeLease hook")
 
@@ -851,7 +863,7 @@ class HookExecutor:
                     "Lease %s ended during beforeLease hook, skipping LEASE_READY transition",
                     lease_scope.lease_name,
                 )
-                return
+                return outcome
 
             if warning:
                 msg = f"{HOOK_WARNING_PREFIX}beforeLease hook warning: {warning}"
@@ -866,7 +878,7 @@ class HookExecutor:
                 await record("before_lease", LeaseHookPhase.FAILED, str(e), e.on_failure)
                 # on_failure='exit' - defer shutdown until client handles the failure
                 logger.error("beforeLease hook failed with on_failure='exit': %s", e)
-                lease_scope.skip_after_lease_hook = True
+                outcome = SetupOutcome.NO_CLEANUP
                 await report_status(
                     ExporterStatus.BEFORE_LEASE_HOOK_FAILED,
                     f"beforeLease hook failed (on_failure=exit, shutting down): {e}",
@@ -880,7 +892,7 @@ class HookExecutor:
             else:
                 # on_failure='endLease' - report failure, release in finally block
                 logger.error("beforeLease hook failed with on_failure='endLease': %s", e)
-                lease_scope.skip_after_lease_hook = True
+                outcome = SetupOutcome.NO_CLEANUP
                 # Defensive redundancy: this branch is only reached for endLease,
                 # but re-check the policy so a future policy change cannot
                 # silently start releasing leases here.
@@ -913,6 +925,7 @@ class HookExecutor:
                 with CancelScope(shield=True):
                     await anyio.sleep(1.0)
                     await self._safe_release_lease(request_lease_release, lease_scope)
+        return outcome
 
     async def run_after_lease_hook(
         self,
@@ -921,7 +934,7 @@ class HookExecutor:
         shutdown: Callable[..., None],
         request_lease_release: Callable[["LeaseContext"], Awaitable[None]] | None = None,
         record_hook: RecordHook | None = None,
-    ) -> None:
+    ) -> str | None:
         """Execute after-lease hook with full orchestration.
 
         This method handles the complete lifecycle of running an after-lease hook:
@@ -940,9 +953,14 @@ class HookExecutor:
                 controller; receives the LeaseContext of the lease whose hook failed
             record_hook: Async callback recording hook transitions with the controller;
                 the hook starts only once its start is recorded
+
+        Returns:
+            Why the device state is unknown, when the hook failed unexpectedly
+            (outside its onFailure policy); None otherwise.
         """
         record = record_hook or _record_nothing
         should_release = False
+        unknown_state = None
         try:
             # Verify lease scope is ready - for after-lease this should always be true
             # since we've already processed the lease, but check defensively
@@ -1026,7 +1044,7 @@ class HookExecutor:
             # failure, and the exporter parks instead of admitting another lease.
             # An orchestration error is not an explicit endLease hook failure.
             logger.error("afterLease hook failed with unexpected error: %s", e)
-            lease_scope.cleanup_failure = str(e)
+            unknown_state = str(e)
             await record("after_lease", LeaseHookPhase.FAILED, str(e))
             await report_status(
                 ExporterStatus.AFTER_LEASE_HOOK_FAILED,
@@ -1040,3 +1058,4 @@ class HookExecutor:
                 # Give the client time to observe the failure before release.
                 await anyio.sleep(1.0)
                 await self._safe_release_lease(request_lease_release, lease_scope)
+        return unknown_state

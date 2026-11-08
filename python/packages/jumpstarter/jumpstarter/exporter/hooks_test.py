@@ -14,6 +14,7 @@ from jumpstarter.exporter.hooks import (
     MAX_MOTD_BYTES,
     HookExecutionError,
     HookExecutor,
+    SetupOutcome,
     _flush_lines,
     _monotonic,
 )
@@ -599,7 +600,7 @@ class TestHookExecutor:
             assert any("GIT_TERMINAL_PROMPT=0" in call for call in info_calls)
 
     async def test_before_lease_hook_exit_sets_skip_flag(self, lease_scope) -> None:
-        """Test that beforeLease hook failure with on_failure=exit sets skip_after_lease_hook flag."""
+        """Test that beforeLease hook failure with on_failure=exit leaves no cleanup owed."""
         hook_config = HookConfigV1Alpha1(
             beforeLease=HookInstanceConfigV1Alpha1(script="exit 1", timeout=10, onFailure="exit"),
         )
@@ -608,19 +609,17 @@ class TestHookExecutor:
         mock_report_status = AsyncMock()
         mock_shutdown = MagicMock()
 
-        assert lease_scope.skip_after_lease_hook is False
-
-        await executor.run_before_lease_hook(
+        outcome = await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
             mock_shutdown,
         )
 
-        assert lease_scope.skip_after_lease_hook is True
+        assert outcome is SetupOutcome.NO_CLEANUP
         mock_shutdown.assert_called_once_with(exit_code=1, wait_for_lease_exit=True, should_unregister=True)
 
     async def test_before_lease_hook_endlease_sets_skip_flag_and_releases_lease(self, lease_scope) -> None:
-        """Test that beforeLease hook failure with on_failure=endLease sets skip_after_lease_hook and releases lease."""
+        """Test that beforeLease hook failure with on_failure=endLease leaves no cleanup owed and releases the lease."""
         hook_config = HookConfigV1Alpha1(
             beforeLease=HookInstanceConfigV1Alpha1(script="exit 1", timeout=10, onFailure="endLease"),
         )
@@ -630,14 +629,14 @@ class TestHookExecutor:
         mock_shutdown = MagicMock()
         mock_request_lease_release = AsyncMock()
 
-        await executor.run_before_lease_hook(
+        outcome = await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
             mock_shutdown,
             mock_request_lease_release,
         )
 
-        assert lease_scope.skip_after_lease_hook is True
+        assert outcome is SetupOutcome.NO_CLEANUP
         # The release callback must receive the LeaseContext of the lease
         # whose hook failed, so the exporter can reject it if that lease
         # was replaced while the release was in flight.
@@ -656,14 +655,14 @@ class TestHookExecutor:
         mock_request_lease_release = AsyncMock(side_effect=RuntimeError("controller unavailable"))
 
         # Should not raise even when request_lease_release fails
-        await executor.run_before_lease_hook(
+        outcome = await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
             mock_shutdown,
             mock_request_lease_release,
         )
 
-        assert lease_scope.skip_after_lease_hook is True
+        assert outcome is SetupOutcome.NO_CLEANUP
         mock_request_lease_release.assert_called_once()
 
     async def test_pty_output_drained_after_stop_flag_set(self) -> None:
@@ -1330,7 +1329,7 @@ class TestHookExecutorPRRegressions:
         """Issue C3b: before_lease_hook event must be set when hook fails with exit.
 
         Same as C3 but for on_failure=exit. The event must be set, shutdown called,
-        and skip_after_lease_hook set to True.
+        and no cleanup owed.
         """
         hook_config = HookConfigV1Alpha1(
             beforeLease=HookInstanceConfigV1Alpha1(script="exit 1", timeout=10, onFailure="exit"),
@@ -1340,14 +1339,14 @@ class TestHookExecutorPRRegressions:
         mock_report_status = AsyncMock()
         mock_shutdown = MagicMock()
 
-        await executor.run_before_lease_hook(
+        outcome = await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
             mock_shutdown,
         )
 
         assert lease_scope.before_lease_hook.is_set()
-        assert lease_scope.skip_after_lease_hook is True
+        assert outcome is SetupOutcome.NO_CLEANUP
         mock_shutdown.assert_called_once()
 
     async def test_no_hooks_transitions_to_lease_ready(self, lease_scope) -> None:
@@ -1382,7 +1381,7 @@ class TestHookExecutorPRRegressions:
     async def test_skip_after_lease_prevents_after_hook_execution(self, lease_scope) -> None:
         """Issue E1: beforeLease fail+exit should prevent afterLease hook execution.
 
-        When beforeLease fails with on_failure=exit, skip_after_lease_hook is set
+        When beforeLease fails with on_failure=exit, no cleanup is owed
         to True. The handle_lease finally block checks this flag and skips the
         afterLease hook. This test verifies the orchestration sequence.
         """
@@ -1401,17 +1400,17 @@ class TestHookExecutorPRRegressions:
         mock_shutdown = MagicMock()
 
         # Run before hook (which fails and sets skip flag)
-        await executor.run_before_lease_hook(
+        outcome = await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
             mock_shutdown,
         )
 
-        assert lease_scope.skip_after_lease_hook is True
+        assert outcome is SetupOutcome.NO_CLEANUP
 
         # Now simulate what handle_lease does: check the flag before running after hook
-        # This mirrors the actual code: `if not lease_scope.skip_after_lease_hook:`
-        if not lease_scope.skip_after_lease_hook:
+        # This mirrors the lifecycle: cleanup runs only when setup leaves it owed.
+        if outcome is SetupOutcome.CLEAN_UP:
             await executor.run_after_lease_hook(
                 lease_scope,
                 mock_report_status,
@@ -1710,7 +1709,7 @@ class TestBeforeLeaseHookLeaseEndedGuard:
 
     async def test_run_before_lease_hook_skips_entirely_when_lease_ended(self, lease_scope) -> None:
         """When the lease has already ended before the hook runs, the hook
-        subprocess must NOT be executed and skip_after_lease_hook must be set."""
+        subprocess must NOT be executed and no cleanup must be owed."""
         hook_config = HookConfigV1Alpha1(
             beforeLease=HookInstanceConfigV1Alpha1(script="echo setup", timeout=10),
         )
@@ -1725,7 +1724,7 @@ class TestBeforeLeaseHookLeaseEndedGuard:
 
         mock_shutdown = MagicMock()
 
-        await executor.run_before_lease_hook(
+        outcome = await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
             mock_shutdown,
@@ -1734,8 +1733,8 @@ class TestBeforeLeaseHookLeaseEndedGuard:
         assert len(status_calls) == 0, (
             f"No status should be reported when hook is skipped due to lease ended, got: {status_calls}"
         )
-        assert lease_scope.skip_after_lease_hook is True, (
-            "skip_after_lease_hook must be set when beforeLease hook is skipped"
+        assert outcome is SetupOutcome.NO_CLEANUP, (
+            "no cleanup must be owed when beforeLease hook is skipped"
         )
 
     async def test_run_before_lease_hook_sets_event_even_when_lease_ended(self, lease_scope) -> None:
@@ -1778,7 +1777,7 @@ class TestBeforeLeaseHookLeaseEndedGuard:
 
         mock_shutdown = MagicMock()
 
-        await executor.run_before_lease_hook(
+        outcome = await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
             mock_shutdown,
@@ -1787,8 +1786,8 @@ class TestBeforeLeaseHookLeaseEndedGuard:
         assert len(status_calls) == 0, (
             f"No status should be reported when hook is skipped due to lease ended, got: {status_calls}"
         )
-        assert lease_scope.skip_after_lease_hook is True, (
-            "skip_after_lease_hook must be set when beforeLease hook is skipped (warn)"
+        assert outcome is SetupOutcome.NO_CLEANUP, (
+            "no cleanup must be owed when beforeLease hook is skipped (warn)"
         )
 
     async def test_lease_without_a_session_fails_setup_at_once(self) -> None:
@@ -1853,7 +1852,7 @@ class TestBeforeLeaseHookLeaseEndedGuard:
 
         mock_shutdown = MagicMock()
 
-        await executor.run_before_lease_hook(
+        outcome = await executor.run_before_lease_hook(
             lease_scope,
             mock_report_status,
             mock_shutdown,
@@ -1862,8 +1861,8 @@ class TestBeforeLeaseHookLeaseEndedGuard:
         assert len(status_calls) == 0, (
             f"No status should be reported when bailing out during is_ready wait, got: {status_calls}"
         )
-        assert lease_scope.skip_after_lease_hook is True, (
-            "skip_after_lease_hook must be set when skipping during is_ready wait"
+        assert outcome is SetupOutcome.NO_CLEANUP, (
+            "no cleanup must be owed when skipping during is_ready wait"
         )
         assert lease_scope.before_lease_hook.is_set(), (
             "before_lease_hook event must be set to unblock downstream waiters"

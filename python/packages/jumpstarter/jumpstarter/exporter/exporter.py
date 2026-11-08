@@ -39,7 +39,7 @@ from jumpstarter.common.telemetry_token import TelemetryCredential
 from jumpstarter.config.env import JMP_GRPC_INSECURE, JUMPSTARTER_GRPC_INSECURE
 from jumpstarter.config.exporter import DEFAULT_STATUS_STREAM_RETRY_TIMEOUT
 from jumpstarter.config.tls import TLSConfigV1Alpha1
-from jumpstarter.exporter.hooks import HookExecutor, failure_ends_lease
+from jumpstarter.exporter.hooks import HookExecutor, SetupOutcome, failure_ends_lease
 from jumpstarter.exporter.inputs import Assignment, InputBuffer, Inputs
 from jumpstarter.exporter.lease_context import LeaseContext
 from jumpstarter.exporter.lease_hooks import (
@@ -1473,20 +1473,15 @@ class Exporter(AsyncContextManagerMixin, Metadata):
                 lease.notify = self._inputs.notify
                 session.lease_context = lease
                 session.update_status(lease.current_status, lease.status_message)
-                try:
-                    await self._lease_activity(lease, entry, connections=True)
-                except get_cancelled_exc_class():
-                    await self._cleanup_on_cancel(lease)
-                    raise
+                parked = await self._lease_activity(lease, entry, connections=True)
         finally:
             lease.before_lease_hook.set()
-            lease.after_lease_hook_done.set()
             self._lease_context = None
             clear_log_context()
             set_log_context(exporter=self.exporter_name)
             self._phase.move(Phase.IDLE)
-        if lease.cleanup_failure is not None:
-            return lease.cleanup_failure
+        if parked is not None:
+            return parked
         # Ready for the next lease. This also clears a failure status a lease
         # ended with (an endLease failure the controller ended it for); a stopping
         # exporter does not report it (_report_status).
@@ -1512,99 +1507,107 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         )
         await self._inputs.wait_until(lambda i: i.stop is not None)
 
-    async def _lease_activity(self, lease: LeaseContext, entry: "Entry", *, connections: bool) -> None:
+    async def _lease_activity(self, lease: LeaseContext, entry: "Entry", *, connections: bool) -> str | None:
+        """Set up, serve and clean up one lease, then hold it until it is released.
+
+        Returns why to park: the afterLease hook failed unexpectedly. Cancelled
+        (a fatal stream error, or a forced stop), it still cleans up what setup
+        left owed, within the stop grace.
+        """
         if lease.lease_ended.is_set() and entry is Entry.NEW:
             logger.info("Lease %s already ended, skipping", lease.lease_name)
             await self._report_status(ExporterStatus.AVAILABLE, "Available for new lease")
-            return
+            return None
 
-        # A lease that ended while no process served it has no clients to connect.
-        async with self._lease_connections(lease, enabled=connections and not lease.lease_ended.is_set()):
-            if lease.hooks.resumed is not None:
-                # An earlier process ran this lease's setup: say what it said, run nothing.
-                await self._report_status(*lease.hooks.resumed)
-                lease.before_lease_hook.set()
-            else:
-                await self._run_setup(lease)
-            if lease.skip_after_lease_hook:
-                # Setup failed with endLease/exit: no cleanup. Close the record's
-                # cleanup, or the controller holds this exporter for it, and keep
-                # the session (and the failure status) until the lease is released.
-                if lease.hooks.recorded:
-                    await self._record_lease_hook(
-                        lease, "after_lease", LeaseHookPhase.SKIPPED, "beforeLease hook failed"
-                    )
-                await self._hold(lease)
-                return
-            if entry is Entry.CLEAN_UP and not lease.lease_ended.is_set():
-                # Owed cleanup of a lease still assigned: finish it as after EndSession.
-                await self._run_cleanup(lease)
-                await self._hold(lease)
-                return
-            if not lease.lease_ended.is_set():
-                self._phase.move(Phase.SERVING)
-            inputs = await self._inputs.wait_until(
-                lambda i: lease.lease_ended.is_set() or i.stop_now or lease.end_session_requested.is_set()
-            )
-            if lease.end_session_requested.is_set() and not lease.lease_ended.is_set() and not inputs.stop_now:
-                # The client asked to end its session: clean up while it is still
-                # connected, so it receives the afterLease output.
-                logger.info("EndSession requested, running afterLease hook")
-                await self._run_cleanup(lease)
-                await self._hold(lease)
-                return
-            if inputs.stop_now and lease.hooks.tracked and not lease.lease_ended.is_set():
-                # A restart is a process event, not a lease event: the lease and its
-                # device stay as they are, and the next process resumes it from the record.
-                logger.info("Stopping: leaving lease %s to the next exporter process", lease.lease_name)
-                return
+        setup = SetupOutcome.CLEAN_UP
+        try:
+            # A lease that ended while no process served it has no clients to connect.
+            async with self._lease_connections(lease, enabled=connections and not lease.lease_ended.is_set()):
+                if lease.hooks.resumed is not None:
+                    # An earlier process ran this lease's setup: say what it said, run nothing.
+                    await self._report_status(*lease.hooks.resumed)
+                    lease.before_lease_hook.set()
+                else:
+                    setup = await self._run_setup(lease)
+                if setup is SetupOutcome.NO_CLEANUP:
+                    await self._hold_without_cleanup(lease)
+                    return None
+                if entry is Entry.CLEAN_UP and not lease.lease_ended.is_set():
+                    # Owed cleanup of a lease still assigned: finish it as after EndSession.
+                    return await self._clean_up_and_hold(lease)
+                if not lease.lease_ended.is_set():
+                    self._phase.move(Phase.SERVING)
+                inputs = await self._inputs.wait_until(
+                    lambda i: lease.lease_ended.is_set() or i.stop_now or lease.end_session_requested.is_set()
+                )
+                if lease.end_session_requested.is_set() and not lease.lease_ended.is_set() and not inputs.stop_now:
+                    # The client asked to end its session: clean up while it is still
+                    # connected, so it receives the afterLease output.
+                    logger.info("EndSession requested, running afterLease hook")
+                    return await self._clean_up_and_hold(lease)
+                if inputs.stop_now and lease.hooks.tracked and not lease.lease_ended.is_set():
+                    # A restart is a process event, not a lease event: the lease and its
+                    # device stay as they are, and the next process resumes it from the record.
+                    logger.info("Stopping: leaving lease %s to the next exporter process", lease.lease_name)
+                    return None
 
-        # Released, revoked or stopping: client connections are closed before
-        # cleanup touches the device.
-        await self._run_cleanup(lease)
+            # Released, revoked or stopping: client connections are closed before
+            # cleanup touches the device.
+            return await self._clean_up_and_hold(lease)
+        except get_cancelled_exc_class():
+            if setup is SetupOutcome.CLEAN_UP:
+                await self._cleanup_on_cancel(lease)
+            raise
+
+    async def _hold_without_cleanup(self, lease: LeaseContext) -> None:
+        """Hold a lease whose setup leaves no cleanup, keeping its failure status until release.
+
+        The record's cleanup is closed first, or the controller holds this exporter for it.
+        """
+        if lease.hooks.recorded:
+            await self._record_lease_hook(lease, "after_lease", LeaseHookPhase.SKIPPED, "beforeLease hook failed")
         await self._hold(lease)
+
+    async def _clean_up_and_hold(self, lease: LeaseContext) -> str | None:
+        unknown_state = await self._run_cleanup(lease)
+        await self._hold(lease)
+        return unknown_state
 
     async def _hold(self, lease: LeaseContext) -> None:
         """Keep the lease's session until the controller releases the lease, or a stop."""
         self._phase.move(Phase.HOLDING)
         await self._inputs.wait_until(lambda i: lease.lease_ended.is_set() or i.stop_now)
 
-    async def _run_setup(self, lease: LeaseContext) -> None:
+    async def _run_setup(self, lease: LeaseContext) -> SetupOutcome:
         if not self.hook_executor:
             await self._report_status(ExporterStatus.LEASE_READY, "Ready for commands")
             lease.before_lease_hook.set()
-            return
+            return SetupOutcome.CLEAN_UP
         async with self._stoppable("beforeLease hook"):
-            await self.hook_executor.run_before_lease_hook(
+            return await self.hook_executor.run_before_lease_hook(
                 lease, self._report_status, self.stop, self._request_lease_release,
                 record_hook=partial(self._record_lease_hook, lease),
             )
+        return SetupOutcome.CLEAN_UP  # cut off by the stop grace: cleanup still runs
 
-    async def _run_cleanup(self, lease: LeaseContext) -> None:
+    async def _run_cleanup(self, lease: LeaseContext) -> str | None:
+        """Run the afterLease hook once. Returns why the device state is unknown, if it is."""
         if lease.after_lease_hook_started.is_set():
-            return
+            return None
         lease.after_lease_hook_started.set()
         self._phase.move(Phase.CLEANUP)
-        try:
-            if (
-                self.hook_executor
-                and (lease.has_client() or self._standalone)
-                and not lease.skip_after_lease_hook
-            ):
-                logger.info("Running afterLease hook")
-                async with self._stoppable("afterLease hook"):
-                    await self.hook_executor.run_after_lease_hook(
-                        lease, self._report_status, self.stop, self._request_lease_release,
-                        record_hook=partial(self._record_lease_hook, lease),
-                    )
-            else:
-                if lease.hooks.tracked and not lease.skip_after_lease_hook:
-                    await self._record_lease_hook(
-                        lease, "after_lease", LeaseHookPhase.SKIPPED, "no client used the lease"
-                    )
-                await self._report_status(ExporterStatus.AVAILABLE, "Available for new lease")
-        finally:
-            lease.after_lease_hook_done.set()
+        if self.hook_executor and (lease.has_client() or self._standalone):
+            logger.info("Running afterLease hook")
+            async with self._stoppable("afterLease hook"):
+                return await self.hook_executor.run_after_lease_hook(
+                    lease, self._report_status, self.stop, self._request_lease_release,
+                    record_hook=partial(self._record_lease_hook, lease),
+                )
+            return None  # cut off by the stop grace
+        if lease.hooks.tracked:
+            await self._record_lease_hook(lease, "after_lease", LeaseHookPhase.SKIPPED, "no client used the lease")
+        await self._report_status(ExporterStatus.AVAILABLE, "Available for new lease")
+        return None
 
     async def _cleanup_on_cancel(self, lease: LeaseContext) -> None:
         """The activity was cancelled (fatal stream error, or a forced stop).
@@ -1614,9 +1617,7 @@ class Exporter(AsyncContextManagerMixin, Metadata):
         still runs, bounded by stop_grace, as it did when the exporter shut down
         mid-lease.
         """
-        if self._forced or lease.hooks.tracked:
-            return
-        if lease.skip_after_lease_hook or lease.after_lease_hook_started.is_set():
+        if self._forced or lease.hooks.tracked or lease.after_lease_hook_started.is_set():
             return
         with CancelScope(shield=True, deadline=anyio.current_time() + self.stop_grace):
             await self._run_cleanup(lease)
@@ -1720,11 +1721,8 @@ class Exporter(AsyncContextManagerMixin, Metadata):
                     ), create_task_group() as tg:
                         self._tg = tg
                         self._phase.move(Phase.SETUP)
-                        try:
-                            await self._lease_activity(lease, Entry.NEW, connections=False)
-                        except get_cancelled_exc_class():
-                            await self._cleanup_on_cancel(lease)
-                            raise
+                        # Standalone serves one lease until stopped: there is nothing to park.
+                        await self._lease_activity(lease, Entry.NEW, connections=False)
                         tg.cancel_scope.cancel()
         finally:
             self._phase.move(Phase.IDLE)

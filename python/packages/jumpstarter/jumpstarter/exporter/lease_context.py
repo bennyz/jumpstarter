@@ -33,15 +33,12 @@ class LeaseContext:
         before_lease_hook: Event that signals when before-lease hook completes
         end_session_requested: Event that signals when client requests end session (to run afterLease hook)
         after_lease_hook_started: Event that signals when afterLease hook has started (prevents double execution)
-        after_lease_hook_done: Event that signals when afterLease hook has completed
         lease_ended: Event that signals when the lease has ended (from controller status update)
         client_name: Name of the client currently holding the lease (empty if unleased)
         current_status: Current exporter status (stored here for access before session is created)
         status_message: Message describing the current status
         hooks: How this process runs the lease's hooks, and what the controller's hook record
             shows of them (see lease_hooks)
-        cleanup_failure: Why the afterLease hook failed unexpectedly (not through its
-            onFailure policy); the device state is then unknown and the exporter parks
     """
 
     lease_name: str
@@ -49,7 +46,6 @@ class LeaseContext:
     lease_uid: str = ""
     end_session_requested: Event = field(default_factory=Event)
     after_lease_hook_started: Event = field(default_factory=Event)
-    after_lease_hook_done: Event = field(default_factory=Event)
     lease_ended: Event = field(default_factory=Event)  # Signals lease has ended (from controller)
     session: "Session | None" = None
     socket_path: str = ""
@@ -57,9 +53,7 @@ class LeaseContext:
     client_name: str = field(default="")
     current_status: ExporterStatus = field(default=ExporterStatus.AVAILABLE)
     status_message: str = field(default="")
-    skip_after_lease_hook: bool = False
     hooks: HookPlan = field(default_factory=HookPlan)
-    cleanup_failure: str | None = None
     notify: Callable[[], None] | None = field(default=None, repr=False)
     """Wakes the exporter lifecycle; called after setting a lease-local flag."""
 

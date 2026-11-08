@@ -44,12 +44,10 @@ class TestLeaseContextInitialization:
 
         assert ctx.end_session_requested is not None
         assert ctx.after_lease_hook_started is not None
-        assert ctx.after_lease_hook_done is not None
         assert ctx.lease_ended is not None
         # Events should not be set by default
         assert not ctx.end_session_requested.is_set()
         assert not ctx.after_lease_hook_started.is_set()
-        assert not ctx.after_lease_hook_done.is_set()
         assert not ctx.lease_ended.is_set()
 
 

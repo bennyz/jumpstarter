@@ -16,6 +16,7 @@ from anyio import (
 from anyio.abc import SocketStream
 from anyio.streams.stapled import StapledObjectStream
 
+from .common import DBUS_NETWORK_KIND_LABEL
 from .streams.websocket import WebsocketClientStream
 from jumpstarter.driver import Driver, export, exportstream
 
@@ -219,7 +220,7 @@ class DbusNetwork(NetworkInterface, Driver):
     scheme: str | None = field(init=False, default=None)
     args: dict[str, str | int] = field(init=False, default_factory=dict)
 
-    KIND_LABEL: ClassVar[str] = "jumpstarter.dev/dbusnetwork/kind"
+    KIND_LABEL: ClassVar[str] = DBUS_NETWORK_KIND_LABEL
 
     @classmethod
     def client(cls) -> str:

@@ -9,7 +9,7 @@ import click
 from anyio import ContextManagerMixin
 
 from .adapters import DbusAdapter, TcpPortforwardAdapter, UnixPortforwardAdapter
-from .driver import DbusNetwork
+from .common import DBUS_NETWORK_KIND_LABEL
 from jumpstarter.client import DriverClient
 from jumpstarter.client.core import DriverMethodNotImplemented
 from jumpstarter.client.decorators import driver_click_group
@@ -105,7 +105,7 @@ class DbusNetworkClient(NetworkClient, ContextManagerMixin):
 
     @property
     def kind(self):
-        return self.labels[DbusNetwork.KIND_LABEL]
+        return self.labels[DBUS_NETWORK_KIND_LABEL]
 
 
 def _parse_address(addr: str) -> tuple[str, str]:

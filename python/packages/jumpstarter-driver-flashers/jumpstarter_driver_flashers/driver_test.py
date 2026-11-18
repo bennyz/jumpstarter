@@ -1,11 +1,13 @@
 import os
 import tempfile
+from pathlib import Path
 
 import pytest
 from jumpstarter_driver_composite.driver import Composite, Proxy
 from jumpstarter_driver_power.driver import MockPower
 from jumpstarter_driver_pyserial.driver import PySerial
 from jumpstarter_driver_tftp.driver import Tftp
+from oras.provider import Registry
 
 from .driver import BaseFlasher
 from jumpstarter.client.core import DriverError, DriverInvalidArgument
@@ -94,6 +96,120 @@ def test_drivers_flashers_setup_flasher_bundle(complete_flasher):
         assert client.tftp.storage.read_bytes(kernel) == b"\x00" * 1024
         assert client.tftp.storage.read_bytes(initram) == b"\x00" * 1024 * 2
         assert client.tftp.storage.read_bytes(dtb) == b"\x00" * 1024 * 3
+
+
+@pytest.fixture
+def new_session(tmp_path):
+    """Start a session of a new flasher on a cache shared by the test"""
+
+    def session():
+        return serve(
+            BaseFlasher(
+                flasher_bundle="quay.io/jumpstarter-dev/jumpstarter-flasher-test:new",
+                cache_dir=str(tmp_path / "cache"),
+                http_dir=str(tmp_path / "http"),
+                tftp_dir=str(tmp_path / "tftp"),
+                children={"serial": PySerial(url="loop://"), "power": MockPower()},
+            )
+        )
+
+    return session
+
+
+def cached_bundles(tmp_path):
+    return len(list((tmp_path / "cache").rglob("manifest.yaml")))
+
+
+def test_drivers_flashers_bundle_cache_outlives_session(tmp_path, monkeypatch, new_session):
+    """A new session reuses the cached bundle until its tag moves to another manifest"""
+    downloads = []
+    download_blob = Registry.download_blob
+
+    def counting_download_blob(self, container, digest, outfile):
+        downloads.append(digest)
+        return download_blob(self, container, digest, outfile)
+
+    monkeypatch.setattr(Registry, "download_blob", counting_download_blob)
+
+    with new_session() as client:
+        manifest = client.call("get_flasher_manifest_yaml")
+    pulled = len(downloads)
+    assert pulled > 0
+
+    with new_session() as client:
+        assert client.call("get_flasher_manifest_yaml") == manifest
+    assert len(downloads) == pulled
+
+    # the registry moves the tag to the manifest :latest points at, which ships another manifest.yaml
+    do_request = Registry.do_request
+    monkeypatch.setattr(
+        Registry,
+        "do_request",
+        lambda self, url, *args, **kwargs: do_request(
+            self, url.replace("/manifests/new", "/manifests/latest"), *args, **kwargs
+        ),
+    )
+    with new_session() as client:
+        assert client.call("get_flasher_manifest_yaml") != manifest
+    assert len(downloads) > pulled
+    assert cached_bundles(tmp_path) == 1
+
+
+def test_drivers_flashers_bundle_cache_tag_moves_during_pull(monkeypatch, new_session):
+    """A tag moving between the digest lookup and the pull does not cache the new files under the old digest"""
+    do_request = Registry.do_request
+    lookups = []
+
+    def tag_moves_after_lookup(self, url, *args, **kwargs):
+        if "/manifests/new" in url:
+            if lookups:
+                url = url.replace("/manifests/new", "/manifests/latest")
+            lookups.append(url)
+        return do_request(self, url, *args, **kwargs)
+
+    monkeypatch.setattr(Registry, "do_request", tag_moves_after_lookup)
+    with new_session() as client:
+        before = client.call("get_flasher_manifest_yaml")
+    with new_session() as client:
+        assert client.call("get_flasher_manifest_yaml") != before
+
+
+def test_drivers_flashers_bundle_cache_skips_failed_pull(monkeypatch, new_session):
+    """A pull that breaks off halfway leaves nothing a later session trusts"""
+    download_blob = Registry.download_blob
+
+    def broken_kernel_stream(self, container, digest, outfile):
+        if outfile.endswith("kernel"):
+            # oras truncates the file before it reads the stream
+            Path(outfile).write_bytes(b"\x00" * 10)
+            raise ConnectionError("stream broke")
+        return download_blob(self, container, digest, outfile)
+
+    monkeypatch.setattr(Registry, "download_blob", broken_kernel_stream)
+    with new_session() as client, pytest.raises(DriverError, match="stream broke"):
+        client.call("setup_flasher_bundle")
+
+    monkeypatch.setattr(Registry, "download_blob", download_blob)
+    with new_session() as client:
+        client.call("setup_flasher_bundle")
+        assert client.tftp.storage.read_bytes(client.call("get_kernel_filename")) == b"\x00" * 1024
+
+
+def test_drivers_flashers_bundle_cache_concurrent_pull(tmp_path, monkeypatch, new_session):
+    """A session whose pull another session publishes first serves the published copy"""
+    pull = Registry.pull
+    published = []
+
+    def pull_beside_another_session(self, *args, **kwargs):
+        monkeypatch.setattr(Registry, "pull", pull)
+        with new_session() as client:
+            published.append(client.call("get_flasher_manifest_yaml"))
+        return pull(self, *args, **kwargs)
+
+    monkeypatch.setattr(Registry, "pull", pull_beside_another_session)
+    with new_session() as client:
+        assert [client.call("get_flasher_manifest_yaml")] == published
+    assert cached_bundles(tmp_path) == 1
 
 
 def test_drivers_flashers_manifest(complete_flasher):

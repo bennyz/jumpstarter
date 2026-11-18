@@ -1,11 +1,16 @@
+import hashlib
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import anyio.to_thread
+import oras.defaults
 from jumpstarter_driver_composite.driver import Proxy
 from jumpstarter_driver_http.driver import HttpServer
 from jumpstarter_driver_tftp.driver import Tftp
 from jumpstarter_driver_uboot.driver import UbootConsole
+from oras.container import Container
 from oras.provider import Registry
 
 from .bundle import FlasherBundleManifestV1Alpha1
@@ -15,6 +20,61 @@ from jumpstarter.driver import Driver, export
 # Where the exporter image installs the aarch64 fls build served to the DUT
 # (see python/Containerfile), in order of preference.
 FLS_BINARY_PATHS = (Path("/usr/local/bin/fls-aarch64"), Path("/usr/local/bin/fls"))
+
+# Name prefix of the directories bundles are pulled into before they are published
+STAGING_PREFIX = ".pull-"
+
+
+def _manifest_digest(oras_client: Registry, container: Container) -> str:
+    """Return the digest of the manifest the registry serves for the container
+
+    get_manifest() returns only the parsed JSON, and the digest covers the exact bytes.
+    """
+    oras_client.auth.load_configs(container)
+    response = oras_client.do_request(
+        f"{oras_client.prefix}://{container.manifest_url()}",
+        headers={"Accept": oras.defaults.default_manifest_media_type},
+    )
+    response.raise_for_status()
+    return f"sha256:{hashlib.sha256(response.content).hexdigest()}"
+
+
+def _pull_and_publish(oras_client: Registry, reference: str, bundle_dir: Path) -> None:
+    """Pull into a staging directory and publish it as bundle_dir with one rename
+
+    A published directory holds a complete pull and is never written again, so
+    a pull that fails halfway, or runs beside another session's, cannot damage
+    what other sessions read.
+    """
+    bundle_root = bundle_dir.parent
+    bundle_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=bundle_root, prefix=STAGING_PREFIX) as staging:
+        pulled = Path(staging) / "bundle"
+        pulled.mkdir()
+        oras_client.pull(reference, outdir=str(pulled))
+        try:
+            pulled.rename(bundle_dir)
+        except OSError:
+            # another session published the same digest first: keep theirs
+            if not bundle_dir.is_dir():
+                raise
+
+    # Drop older versions of the bundle, and the files of the flat layout older
+    # releases pulled into bundle_root itself. A session on another board still
+    # reading an older version loses it, which takes a tag move during its flash.
+    for entry in bundle_root.iterdir():
+        if entry == bundle_dir or entry.name.startswith(STAGING_PREFIX):
+            continue
+        if entry.is_dir():
+            # another session publishing this digest may be removing it too
+            shutil.rmtree(entry, onexc=_ignore_missing)
+        else:
+            entry.unlink(missing_ok=True)
+
+
+def _ignore_missing(function, path, exc: BaseException) -> None:
+    if not isinstance(exc, FileNotFoundError):
+        raise exc
 
 
 @dataclass(kw_only=True)
@@ -81,8 +141,8 @@ class BaseFlasher(Driver):
                 }
             )
 
-        # bundles that have already been downloaded in the current session
-        self._downloaded = {}
+        # bundles already checked against the registry in the current session
+        self._downloaded: dict[str, Path] = {}
 
     @classmethod
     def client(cls) -> str:
@@ -189,32 +249,34 @@ class BaseFlasher(Driver):
         """Provide a different initram from client"""
         raise NotImplementedError
 
-    def _download_to_cache(self) -> str:
+    def _download_to_cache(self, bundle: str) -> Path:
         """Download the bundle to the cache
 
-        This function downloads the bundle contents to the cache directory,
-        if it was already downloaded during this session we don't download it again.
+        The cache outlives the session and keeps the bundle under its manifest
+        digest, so it is pulled again only when its tag moves to another
+        manifest. Within a session the registry is asked once.
         """
-        if self._downloaded.get(self.flasher_bundle):
-            self.logger.debug(f"Bundled already downloaded: {self.flasher_bundle}")
-            return self._downloaded[self.flasher_bundle]
+        if bundle in self._downloaded:
+            self.logger.debug(f"Bundle already downloaded: {bundle}")
+            return self._downloaded[bundle]
 
         oras_client = Registry()
-        self.logger.info(f"Downloading bundle: {self.flasher_bundle}")
+        container = oras_client.get_container(bundle)
+        digest = _manifest_digest(oras_client, container)
 
         # make a filesystem valid name for the cache directory
-        bundle_subdir = self.flasher_bundle.replace(":", "_").replace("/", "_")
-        bundle_dir = Path(self.cache_dir) / bundle_subdir
+        bundle_root = Path(self.cache_dir) / bundle.replace(":", "_").replace("/", "_")
+        bundle_dir = bundle_root / digest.replace(":", "_")
+        if bundle_dir.is_dir():
+            self.logger.info(f"Using cached bundle {bundle} ({digest}) in {bundle_dir}")
+        else:
+            self.logger.info(f"Downloading bundle: {bundle} ({digest})")
+            # pull by digest, so the files are the ones the digest names even if the tag moves meanwhile
+            _pull_and_publish(oras_client, f"{container.registry}/{container.api_prefix}@{digest}", bundle_dir)
+            self.logger.info(f"Bundle downloaded to {bundle_dir}")
 
-        # ensure the bundle dir exists
-        bundle_dir.mkdir(parents=True, exist_ok=True)
-        oras_client.pull(self.flasher_bundle, outdir=str(bundle_dir))
-
-        self.logger.info(f"Bundle downloaded to {bundle_dir}")
-
-        # mark this bundle as downloaded for the current object lifetime
-        self._downloaded[self.flasher_bundle] = str(bundle_dir)
-        return str(bundle_dir)
+        self._downloaded[bundle] = bundle_dir
+        return bundle_dir
 
     async def _get_file_path(self, filename) -> Path:
         """Get the bundle contents path.
@@ -224,8 +286,9 @@ class BaseFlasher(Driver):
         """
         if filename is None:
             raise ValueError("filename cannot be None")
-        bundle_dir = await anyio.to_thread.run_sync(self._download_to_cache)
-        return Path(bundle_dir) / filename
+        # read the bundle once here: setup_flasher_bundle can change it while the worker runs
+        bundle_dir = await anyio.to_thread.run_sync(self._download_to_cache, self.flasher_bundle)
+        return bundle_dir / filename
 
     @export
     async def get_flasher_manifest_yaml(self) -> str:

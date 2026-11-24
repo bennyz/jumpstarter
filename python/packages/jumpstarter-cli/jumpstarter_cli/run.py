@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 # Phase 3 replaces this with Telemetry reverse-scrape (unix/memory or in-process);
 # bind address is intentionally not a user-facing CLI option.
 _METRICS_BIND_ADDRESS = ":0"
+_REPEAT_SIGNAL_WINDOW = 1.0  # seconds; a repeat within this is the same stop, not a request to force
 
 
 def _parse_listener_bind(value: str) -> tuple[str, int]:
@@ -91,24 +92,34 @@ def _handle_child(  # noqa: C901
     """Handle child process with graceful shutdown."""
     async def serve_with_graceful_shutdown():  # noqa: C901
         received_signal = 0
-        signal_handled = False
+        stop_signal_at: float | None = None
         exporter = None
 
         async def signal_handler():
-            nonlocal received_signal, signal_handled
+            nonlocal received_signal, stop_signal_at
 
             with open_signal_receiver(signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT) as signals:
                 async for sig in signals:
-                    if signal_handled:
-                        continue  # Ignore duplicate signals
-                    received_signal = sig
-                    logger.info("CHILD: Received %d (%s)", received_signal, signal.Signals(received_signal).name)
-
+                    logger.info("CHILD: Received %d (%s)", sig, signal.Signals(sig).name)
+                    if sig == signal.SIGHUP:
+                        # Drain: finish the current lease, then stop. A later stop signal still overrides.
+                        if not received_signal:
+                            received_signal = sig
+                        if exporter:
+                            exporter.stop(wait_for_lease_exit=True, should_unregister=True)
+                        continue
+                    now = anyio.current_time()
+                    if stop_signal_at is not None and now - stop_signal_at < _REPEAT_SIGNAL_WINDOW:
+                        # The same stop delivered twice: systemd signals the whole
+                        # cgroup and the parent also forwards to this process group.
+                        continue
+                    if not received_signal or received_signal == signal.SIGHUP:
+                        received_signal = sig
+                    stop_signal_at = now
                     if exporter:
-                        # Terminate exporter. SIGHUP waits until current lease is let go. Later SIGTERM still overrides
-                        if received_signal != signal.SIGHUP:
-                            signal_handled = True
-                        exporter.stop(wait_for_lease_exit=received_signal == signal.SIGHUP, should_unregister=True)
+                        # The first stop gives running hooks a bounded grace; a
+                        # second one stops immediately.
+                        exporter.stop(should_unregister=True)
 
                 # Start signal handler first, then create exporter
         async with create_task_group() as signal_tg:

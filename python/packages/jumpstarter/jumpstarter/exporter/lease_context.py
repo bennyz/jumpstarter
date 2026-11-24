@@ -4,6 +4,7 @@ This module provides a clean abstraction for managing the lifecycle of resources
 associated with a lease, including the session, socket path, and synchronization events.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -11,10 +12,10 @@ from anyio import Event
 
 from jumpstarter.common import ExporterStatus
 from jumpstarter.config.env import JMP_DRIVERS_ALLOW, JUMPSTARTER_HOST
+from jumpstarter.exporter.lease_hooks import HookPlan
 
 if TYPE_CHECKING:
     from jumpstarter.exporter.session import Session
-
 
 @dataclass
 class LeaseContext:
@@ -26,24 +27,24 @@ class LeaseContext:
 
     Attributes:
         lease_name: Name of the current lease assigned by the controller
-        session: The Session object managing the device and gRPC services (set in handle_lease)
-        socket_path: Unix socket path where the session is serving (set in handle_lease)
+        lease_uid: UID of that lease; tells it apart from an earlier lease with the same name
+        session: The Session object managing the device and gRPC services (set when the lease's session opens)
+        socket_path: Unix socket path where the session is serving (set when the lease's session opens)
         hook_socket_path: Separate Unix socket for hook j commands to avoid SSL frame corruption
         before_lease_hook: Event that signals when before-lease hook completes
         end_session_requested: Event that signals when client requests end session (to run afterLease hook)
-        after_lease_hook_started: Event that signals when afterLease hook has started (prevents double execution)
-        after_lease_hook_done: Event that signals when afterLease hook has completed
         lease_ended: Event that signals when the lease has ended (from controller status update)
         client_name: Name of the client currently holding the lease (empty if unleased)
         current_status: Current exporter status (stored here for access before session is created)
         status_message: Message describing the current status
+        hooks: How this process runs the lease's hooks, and what the controller's hook record
+            shows of them (see lease_hooks)
     """
 
     lease_name: str
     before_lease_hook: Event
+    lease_uid: str = ""
     end_session_requested: Event = field(default_factory=Event)
-    after_lease_hook_started: Event = field(default_factory=Event)
-    after_lease_hook_done: Event = field(default_factory=Event)
     lease_ended: Event = field(default_factory=Event)  # Signals lease has ended (from controller)
     session: "Session | None" = None
     socket_path: str = ""
@@ -51,20 +52,26 @@ class LeaseContext:
     client_name: str = field(default="")
     current_status: ExporterStatus = field(default=ExporterStatus.AVAILABLE)
     status_message: str = field(default="")
-    skip_after_lease_hook: bool = False
+    hooks: HookPlan = field(default_factory=HookPlan)
+    notify: Callable[[], None] | None = field(default=None, repr=False)
+    """Wakes the exporter lifecycle; called after setting a lease-local flag."""
+    controller_ended: Callable[[], bool] | None = field(default=None, repr=False)
+    """Live check against InputBuffer: True once the controller no longer assigns this lease."""
 
     def __post_init__(self):
         """Validate that required resources are present."""
         assert self.before_lease_hook is not None, "LeaseScope requires a before_lease_hook event"
         assert self.lease_name, "LeaseScope requires a non-empty lease_name"
 
-    def is_ready(self) -> bool:
-        """Check if the lease scope has been fully initialized with session and socket.
+    def has_ended(self) -> bool:
+        """Whether this lease ended locally or the controller no longer assigns it."""
+        return self.lease_ended.is_set() or (self.controller_ended is not None and self.controller_ended())
 
-        Note: This checks for resource initialization (session/socket), not lease activity.
-        Use is_active() to check if the lease itself is active.
-        """
-        return self.session is not None and self.socket_path != ""
+    def request_end_session(self) -> None:
+        """The client asked to end its session (EndSession RPC)."""
+        self.end_session_requested.set()
+        if self.notify is not None:
+            self.notify()
 
     def is_active(self) -> bool:
         """Check if this lease is active (has a non-empty lease name)."""

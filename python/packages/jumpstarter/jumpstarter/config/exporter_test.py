@@ -104,6 +104,18 @@ export:
     assert config == ExporterConfigV1Alpha1.load("test")
 
 
+async def test_stop_grace_reaches_the_exporter():
+    config = ExporterConfigV1Alpha1.model_validate({
+        "metadata": {"namespace": "default", "name": "test"},
+        "stopGrace": 8,
+    })
+    assert ExporterConfigV1Alpha1.model_validate(config.model_dump(by_alias=True)).stop_grace == 8
+    async with config.create_exporter(standalone=True) as exporter:
+        assert exporter.stop_grace == 8
+    with pytest.raises(ValueError):
+        ExporterConfigV1Alpha1.model_validate({"metadata": {"namespace": "default", "name": "test"}, "stopGrace": 0})
+
+
 def test_status_stream_retry_timeout_config():
     config = ExporterConfigV1Alpha1.model_validate({
         "metadata": {"namespace": "default", "name": "test"},

@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_STATUS_STREAM_RETRY_TIMEOUT = 30 * 60.0
 
+MAX_HOOK_ATTEMPTS = 3
+"""Times a lifecycle hook is started before a restart that cuts it off counts as a failure."""
+
 
 class HookInstanceConfigV1Alpha1(BaseModel):
     """Configuration for a specific lifecycle hook."""
@@ -57,6 +60,18 @@ class HookInstanceConfigV1Alpha1(BaseModel):
         description=(
             "Action to take when the expected exit code is not returned: 'endLease' to end the lease, "
             "'exit' takes the exporter offline and ends the lease, 'warn' continues and prints a warning"
+        ),
+    )
+    on_interrupt: Literal[
+        "rerun",
+        "fail",
+    ] = Field(
+        default="rerun",
+        alias="onInterrupt",
+        description=(
+            "What the restarted exporter does with a hook that an exporter restart cut off: 'rerun' runs "
+            f"it again (up to {MAX_HOOK_ATTEMPTS} attempts in total, then it fails), 'fail' treats it as "
+            "failed. A failed hook is handled by onFailure."
         ),
     )
 
@@ -201,13 +216,25 @@ class ExporterConfigV1Alpha1(BaseModel):
         alias="statusStreamRetryTimeout",
         description=(
             "Seconds to retry after the controller Status stream fails or ends without a new item "
-            "(default: 1800). On expiry, the exporter exits with status 75 so a service "
-            "manager can restart it."
+            "(default: 1800), counted only while no lease is served: a served lease keeps running "
+            "until the controller is back. On expiry, the exporter stops as on SIGTERM and exits "
+            "with status 75 so a service manager can restart it."
         ),
     )
     exit_on_lease_end: bool = Field(
         default=False,
         alias="exitOnLeaseEnd",
+    )
+    stop_grace: float = Field(
+        default=25.0,
+        gt=0,
+        alias="stopGrace",
+        description=(
+            "Seconds a running lease hook may continue after the exporter is asked to stop "
+            "(default: 25). Counted from the first stop signal and shared by the hooks that run "
+            "after it; keep it below the service manager's stop timeout (podman: 10 s by default, "
+            "Kubernetes: 30 s, systemd: 90 s). A second stop signal skips what is left of it."
+        ),
     )
 
     path: Path | None = Field(default=None)
@@ -433,6 +460,7 @@ class ExporterConfigV1Alpha1(BaseModel):
                 hook_executor=hook_executor,
                 motd=self.motd,
                 exit_on_lease_end=self.exit_on_lease_end,
+                stop_grace=self.stop_grace,
                 status_stream_retry_timeout=self.status_stream_retry_timeout,
                 on_token_rotated=token_rotated,
             )

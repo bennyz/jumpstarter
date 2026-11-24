@@ -64,6 +64,48 @@ If no {term}`hook`s are configured, the {term}`exporter` transitions directly fr
 assignment to `LEASE_READY` and from {term}`session` end to `AVAILABLE`.
 ```
 
+### Lifecycle Phases
+
+The {term}`exporter` logs its phase as it moves through a {term}`lease`
+(`Lifecycle setup -> serving`). These are all the moves it can make:
+
+<!-- Generated from the exporter lifecycle tests, which fail when it is out of date. Do not edit: see python/packages/jumpstarter/jumpstarter/exporter/conftest.py. -->
+```{mermaid}
+stateDiagram-v2
+    [*] --> idle
+    idle --> setup
+    idle --> serving
+    idle --> cleanup
+    idle --> parked
+    idle --> stopping
+    setup --> idle
+    setup --> serving
+    setup --> cleanup
+    setup --> holding
+    serving --> idle
+    serving --> cleanup
+    cleanup --> idle
+    cleanup --> holding
+    holding --> idle
+    parked --> stopping
+    stopping --> [*]
+```
+
+- **`setup`** opens the {term}`session` and runs the `beforeLease` {term}`hook`.
+- **`serving`** lasts until the {term}`lease` ends, the client ends its
+  {term}`session`, or a stop arrives.
+- **`cleanup`** runs the `afterLease` {term}`hook`.
+- **`holding`** keeps the {term}`session`, its logs and its status until the
+  controller releases the {term}`lease`.
+- **`parked`** admits no {term}`lease` after an unexpected `afterLease` failure
+  (see [Unexpected Failures](#unexpected-failures)).
+
+A {term}`lease` normally starts in `setup`. After an {term}`exporter` restart it can
+start in `serving` (its `beforeLease` {term}`hook` already ran) or in `cleanup` (it
+owes its `afterLease` {term}`hook`). `setup` skips `serving` when the
+{term}`lease` ends or the `beforeLease` {term}`hook` fails before the
+{term}`lease` is ready.
+
 ## Configuration
 
 {term}`Hook`s are configured in the `hooks` section of the exporter config file:
@@ -106,6 +148,7 @@ hooks:
 | `hooks.<hook>.script`    | string  | *(required)* | Inline script or path to a script file (auto-detected)                                                                                                                                     |
 | `hooks.<hook>.timeout`   | integer | `120`        | Maximum execution time in seconds                                                                                                                                                          |
 | `hooks.<hook>.onFailure` | string  | `"warn"`     | Action on failure: `"warn"`, `"endLease"`, or `"exit"`                                                                                                                                     |
+| `hooks.<hook>.onInterrupt` | string | `"rerun"`   | What the restarted exporter does with the hook if an exporter restart cut it off: `"rerun"` or `"fail"`. See [Exporter Restarts](#exporter-restarts)                                     |
 
 ### Script Modes
 
@@ -138,7 +181,7 @@ communicate with the {term}`exporter` {term}`session`:
 | ------------------- | ----------------------------------------------------------------------------------- |
 | `JUMPSTARTER_HOST`  | Unix socket path for `j` CLI access to the {term}`exporter` {term}`session`                         |
 | `LEASE_NAME`        | Name of the current {term}`lease` assigned by the {term}`controller`                                |
-| `CLIENT_NAME`       | Name of the client holding the {term}`lease`                                                |
+| `CLIENT_NAME`       | Name of the client holding the {term}`lease` (the client that held it, for an `afterLease` hook run after it ended) |
 | `JMP_DRIVERS_ALLOW` | Set to `UNSAFE` to enable access to all drivers ({term}`hook`s run locally on the {term}`exporter`) |
 | `JMP_MOTD_FILE`     | `beforeLease` only: path to a file; content written here is appended to the motd shown to the client |
 
@@ -201,10 +244,13 @@ not disrupt the workflow.
 
 The {term}`lease` is ended and the client is notified of the failure:
 
-The exporter requests release only when a hook fails with `onFailure: endLease`.
+A {term}`lease` is ended early only when a hook fails with `onFailure: endLease`.
 Successful cleanup, `warn`, skipped hooks, cancellation, and unexpected
-orchestration errors do not request release. Normal completion is handled by
-the client or controller expiry.
+orchestration errors do not end it. Normal completion is handled by the client
+or controller expiry. A controller that keeps the {term}`lease`'s hook record
+(see [Exporter Restarts](#exporter-restarts)) ends the {term}`lease` itself once
+the failure is recorded, so it ends even if the {term}`exporter` stops first.
+With an older controller, the {term}`exporter` requests the release.
 
 - **`beforeLease`**: The exporter status transitions to
   `BEFORE_LEASE_HOOK_FAILED`. The client discovers the failure through status
@@ -240,12 +286,141 @@ until manually restarted. Use `endLease` for most validation scenarios and
 reserve `exit` for critical failures.
 ```
 
+### Unexpected Failures
+
+An `afterLease` {term}`hook` can also fail outside its `onFailure` policy, for
+example when the exporter itself hits an error while running it. The
+{term}`device` may then be in any state, so the {term}`exporter` parks: it keeps
+reporting `AFTER_LEASE_HOOK_FAILED`, which keeps the controller from assigning it
+another {term}`lease`, and admits none until it is restarted. Check the
+{term}`device`, then restart the {term}`exporter`.
+
 ### Timeout Behavior
 
 When a {term}`hook` exceeds its `timeout`, the process is terminated with `SIGTERM`
 followed by `SIGKILL` if the process does not exit within a few seconds. The
 resulting failure is then handled according to the `onFailure` setting, exactly
 as if the script had exited with a non-zero exit code.
+
+### Stopping the Exporter
+
+How a running {term}`hook` is treated depends on how the {term}`exporter` is asked
+to stop:
+
+- `SIGHUP` drains: the current lease runs to its end, including its `afterLease`
+  {term}`hook`, and the {term}`exporter` then exits without taking another lease.
+- `SIGTERM`, `SIGINT` or `SIGQUIT` stops now. Waiting for the lease to end stops
+  at once. A {term}`hook` that is already running may continue for `stopGrace`
+  seconds (default `25`), counted from the signal and shared by every
+  {term}`hook` that runs after it, and is then terminated like a timed-out
+  {term}`hook`. A lease that was being served still runs its `afterLease`
+  {term}`hook` within that grace.
+- A second stop signal stops immediately and skips what is left of the grace. A
+  repeat within one second counts as the same stop: `systemd` signals every
+  process in the unit, and `jmp run` also forwards the signal to the exporter.
+
+Keep `stopGrace` below the service manager's stop timeout: 10 seconds for
+`podman stop`, 30 seconds for Kubernetes and 90 seconds for `systemd` by default.
+
+From the moment it is asked to stop, or from the start of its last lease when
+`exitOnLeaseEnd` is set, the {term}`exporter` never reports `AVAILABLE` to the
+controller, so no further lease is assigned to it. A client that ends its session
+still sees `AVAILABLE` once its `afterLease` {term}`hook` is done.
+
+### Controller Outages
+
+Client sessions go through the router, so they survive a controller outage.
+While the controller is unreachable, a {term}`lease` that is being served keeps
+running and the {term}`exporter` keeps reconnecting. Once the controller is back,
+the {term}`exporter` sends its current status again, since a report can be lost
+during the outage. The {term}`exporter` gives up only when no {term}`lease` is
+served and the outage outlasts `statusStreamRetryTimeout` (default 1800
+seconds), or when the controller rejects its credentials. It then stops as on
+`SIGTERM`, so a running {term}`hook` still gets its `stopGrace`, and exits with
+status `75` for the service manager to restart it. At startup, it waits for the
+controller to accept its registration.
+
+## Exporter Restarts
+
+Restarting the {term}`exporter` process, for example with `systemctl restart`,
+or a crash, does not end the {term}`lease` it is serving. {term}`Hook`s follow the
+lease, not the process: `beforeLease` runs once when a lease starts, and
+`afterLease` once when it ends.
+
+- When the exporter stops during a lease (`SIGTERM`, `SIGINT`, `SIGQUIT`, or
+  exiting after losing its connection to the controller), it does not run the
+  `afterLease` hook and does not release the lease. A hook that is still
+  running gets `stopGrace` seconds and is then stopped; the restarted exporter
+  treats it as cut off. Open client connections drop.
+- When it starts again, it continues from how far the lease's hooks got:
+
+  | Hooks got to | Lease still active | Lease ended while the exporter was down |
+  |---|---|---|
+  | `beforeLease` finished | resumes the lease; no hook runs | runs `afterLease` |
+  | `beforeLease` cut off | runs it again or fails it (`onInterrupt`) | runs `afterLease` |
+  | `afterLease` cut off | runs it again or fails it (`onInterrupt`) | runs it again or fails it (`onInterrupt`) |
+  | `beforeLease` failed with `endLease` or `exit` | skips `afterLease`; releases the lease for `endLease` | skips `afterLease` |
+
+  A resumed lease is not set up again, and the restarted exporter does not reset
+  its device to the default state a new lease starts from (such as the
+  `default` port state of a Ykush driver), so the device stays as the client
+  left it, unless its driver switches it off when the exporter stops (see the
+  note below). A lease that is done with its hooks is never set up again;
+  as without a restart, the exporter releases it only when a hook fails with
+  `onFailure: endLease`, and otherwise leaves it to the client or its expiry.
+
+The exporter reports itself available only after it has run an `afterLease` hook
+it still owed, and the {term}`controller` does not assign a new lease to it
+before that, so cleanup never runs on a device another lease is using.
+
+To end the current lease before stopping, send `SIGHUP` instead: the exporter
+waits for the lease to end, runs the `afterLease` hook, and then exits.
+
+### Hooks Cut Off by a Restart
+
+A hook that was running when the exporter stopped may have done any part of its
+work. `onInterrupt` sets what the restarted exporter does with it:
+
+- `rerun` (default): run the hook again. The `$LEASE_NAME` environment variable
+  stays the same across runs, so a hook can use it to skip work it already did.
+  After 3 attempts the hook fails instead.
+- `fail`: do not run it again; it fails, and its `onFailure` applies. Use this
+  for hooks that are not safe to run twice.
+
+A hook that does not finish within `stopGrace` of a stop signal is cut off the
+same way, and finished by the next exporter process per its `onInterrupt`, so
+`stopGrace` only needs to stay below the service manager's stop timeout (see
+[Stopping the Exporter](#stopping-the-exporter)), not above the hook's `timeout`.
+
+### Requirements
+
+The controller keeps a record of each lease's hooks in the Exporter status
+(`leaseHooks`, see `kubectl get exporter <name> -o yaml`), and the exporter starts
+a hook only after the controller has stored it as running. It also records how
+the hook ended before going on, so a finished hook is never mistaken for one a
+restart cut off. While the controller is unreachable, a lease therefore waits at
+these points; clients cannot connect without the controller anyway, and no
+hook runs before its start is recorded. An exporter that exits after losing
+the controller leaves the rest to its next start: it runs an `afterLease` hook
+the lease still owes, and handles a hook whose outcome was not recorded like
+one a restart cut off. With a controller that does not keep this
+record, the exporter behaves as in earlier releases:
+stopping it runs the `afterLease` hook, and the restarted exporter runs the
+`beforeLease` hook again. Exporters configured with `exitOnLeaseEnd` behave the
+same way, because their runtime does not outlive the exporter process.
+
+Rolling an exporter back to a release without these records is safe: it
+registers without saying it keeps them, so the controller drops its record and
+does not hold it for owed cleanup, and its leases behave as in earlier releases.
+Upgrading it again starts without a record, like the first upgrade.
+
+```{note}
+Some drivers switch the device off whenever the exporter closes a session,
+which includes stopping the exporter and starting it again: the Tasmota power
+driver switches its outlet off, and the QEMU and Android emulator drivers power
+their VM off. A resumed lease then finds the device off, and its `beforeLease`
+hook does not run again to switch it on.
+```
 
 ## Use Cases
 

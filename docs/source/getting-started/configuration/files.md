@@ -123,6 +123,7 @@ motd: | # Optional message of the day shown to clients when they enter a shell
   Welcome to myexporter!
   Flash the device with: j storage flash
 statusStreamRetryTimeout: 1800 # Retry time after Status fails or ends (default: 1800s)
+stopGrace: 25 # Seconds a running lease hook may continue after a stop signal (default: 25s)
 export: # Configure drivers to expose to the clients
   power:
     type: "jumpstarter_driver_power.driver.PduPower" # The driver Python class path and type
@@ -142,6 +143,7 @@ hooks: # Optional lifecycle hooks that run at lease boundaries
       j power on
     timeout: 120       # Hook execution timeout in seconds (default: 120)
     onFailure: warn    # Action on failure: "warn" (default), "endLease", or "exit"
+    onInterrupt: rerun # If a restart cut the hook off: "rerun" (default) or "fail"
   afterLease:
     script: |
       j power off
@@ -153,9 +155,16 @@ The optional `hooks` section configures lifecycle scripts that run at {term}`lea
 boundaries. See [{term}`Hook`s](../../introduction/hooks.md) for full details on
 {term}`hook` configuration, environment variables, and failure handling.
 
+Restarting the exporter does not end the {term}`lease` it is serving: the
+restarted exporter resumes it without running the `beforeLease` hook again. See
+[Exporter Restarts](../../introduction/hooks.md#exporter-restarts).
+
 If the controller's Status stream fails or ends, and no new update arrives
-within `statusStreamRetryTimeout` seconds, `jmp run` exits with status `75`
-(`EX_TEMPFAIL`).
+within `statusStreamRetryTimeout` seconds while no {term}`lease` is served,
+`jmp run` stops as on `SIGTERM` and exits with status `75` (`EX_TEMPFAIL`). A
+served {term}`lease` keeps running through an outage: client sessions go through
+the router, not the controller. See
+[Controller Outages](../../introduction/hooks.md#controller-outages).
 The default is 30 minutes. A service manager can then restart the exporter and
 reload its configuration. Status `1` remains the intentional shutdown code for
 a hook configured with `onFailure: exit`; units using

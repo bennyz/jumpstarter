@@ -3016,6 +3016,84 @@ func TestUpdateLeaseHooksReportsInvalidUpdate(t *testing.T) {
 	}
 }
 
+// A hook that fails with onFailure: endLease ends its lease. The controller
+// ends it once the failure is recorded, so the lease ends even if the exporter
+// stops before releasing it, and a retry of the update ends it if an earlier
+// attempt recorded the failure but could not mark the lease.
+func TestUpdateLeaseHooksEndsLeaseOnEndLeaseFailure(t *testing.T) {
+	const (
+		failed   = jumpstarterdevv1alpha1.LeaseHookPhaseFailed
+		running  = jumpstarterdevv1alpha1.LeaseHookPhaseRunning
+		endLease = pb.LeaseHookFailureAction_LEASE_HOOK_FAILURE_ACTION_END_LEASE
+		warn     = pb.LeaseHookFailureAction_LEASE_HOOK_FAILURE_ACTION_WARN
+	)
+	failure := func(action pb.LeaseHookFailureAction) *pb.LeaseHookState {
+		return &pb.LeaseHookState{Phase: pb.LeaseHookPhase_LEASE_HOOK_PHASE_FAILED, OnFailure: action, Attempts: 1}
+	}
+	before := func(s *pb.LeaseHookState) *pb.UpdateLeaseHooksRequest {
+		return &pb.UpdateLeaseHooksRequest{
+			LeaseName: "a", LeaseUid: "a-1", Hook: &pb.UpdateLeaseHooksRequest_BeforeLease{BeforeLease: s},
+		}
+	}
+	after := func(s *pb.LeaseHookState) *pb.UpdateLeaseHooksRequest {
+		return &pb.UpdateLeaseHooksRequest{
+			LeaseName: "a", LeaseUid: "a-1", Hook: &pb.UpdateLeaseHooksRequest_AfterLease{AfterLease: s},
+		}
+	}
+	hook := func(phase jumpstarterdevv1alpha1.LeaseHookPhase, onFailure string) *jumpstarterdevv1alpha1.LeaseHookStatus {
+		return &jumpstarterdevv1alpha1.LeaseHookStatus{Phase: phase, OnFailure: onFailure, Attempts: 1}
+	}
+	cases := []struct {
+		name        string
+		ended       bool
+		before      *jumpstarterdevv1alpha1.LeaseHookStatus
+		after       *jumpstarterdevv1alpha1.LeaseHookStatus
+		req         *pb.UpdateLeaseHooksRequest
+		wantRelease bool
+	}{
+		{"a setup failure with endLease ends the lease", false, hook(running, ""), nil,
+			before(failure(endLease)), true},
+		{"a cleanup failure with endLease ends a lease still assigned", false,
+			hook(jumpstarterdevv1alpha1.LeaseHookPhaseSucceeded, ""), hook(running, ""),
+			after(failure(endLease)), true},
+		{"a retried endLease failure ends the lease", false, hook(failed, "endLease"), nil,
+			before(failure(endLease)), true},
+		{"a failure with warn keeps the lease", false, hook(running, ""), nil,
+			before(failure(warn)), false},
+		{"a cleanup failure after the lease ended leaves it ended", true,
+			hook(jumpstarterdevv1alpha1.LeaseHookPhaseSucceeded, ""), hook(running, ""),
+			after(failure(endLease)), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lease := &jumpstarterdevv1alpha1.Lease{
+				ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: "default", UID: "a-1"},
+				Spec:       jumpstarterdevv1alpha1.LeaseSpec{ClientRef: corev1.LocalObjectReference{Name: "client-a"}},
+				Status: jumpstarterdevv1alpha1.LeaseStatus{
+					ExporterRef: &corev1.LocalObjectReference{Name: "test-exporter"}, Ended: tc.ended,
+				},
+			}
+			svc, c := leaseHooksService(t, jumpstarterdevv1alpha1.ExporterStatus{
+				LeaseRef: &corev1.LocalObjectReference{Name: "a"},
+				LeaseHooks: &jumpstarterdevv1alpha1.ExporterLeaseHooks{
+					LeaseRef: corev1.LocalObjectReference{Name: "a"}, LeaseUID: "a-1", ClientName: "client-a",
+					BeforeLease: tc.before, AfterLease: tc.after,
+				},
+			}, lease)
+			if _, err := svc.UpdateLeaseHooks(context.Background(), tc.req); err != nil {
+				t.Fatalf("UpdateLeaseHooks: %v", err)
+			}
+			var got jumpstarterdevv1alpha1.Lease
+			if err := c.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "a"}, &got); err != nil {
+				t.Fatalf("failed to get lease: %v", err)
+			}
+			if got.Spec.Release != tc.wantRelease {
+				t.Fatalf("lease spec.release = %v, want %v", got.Spec.Release, tc.wantRelease)
+			}
+		})
+	}
+}
+
 // Status reports are asynchronous: one the exporter sent before it started a
 // lease's record can arrive after it. Such a late Available must leave the
 // record, and the registration that says the exporter keeps it, in place, so
